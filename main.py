@@ -53,8 +53,27 @@ def init_db():
     run("CREATE TABLE IF NOT EXISTS users(user_id TEXT, name TEXT, email TEXT UNIQUE, pw TEXT, salt TEXT, recovery TEXT, ts DOUBLE PRECISION)")
     run("CREATE TABLE IF NOT EXISTS knowledge(user_id TEXT, chunk TEXT, source TEXT, ts DOUBLE PRECISION)")
     run("CREATE TABLE IF NOT EXISTS requests(user_id TEXT, name TEXT, request TEXT, status TEXT, ts DOUBLE PRECISION)")
+    run("CREATE TABLE IF NOT EXISTS access(user_id TEXT, biz_trial_start DOUBLE PRECISION, premium INTEGER, premium_until DOUBLE PRECISION)")
 
 init_db()
+
+TRIAL_DAYS = 7
+
+def check_business_access(user_id):
+    """Returns (allowed, days_left). Business is free for TRIAL_DAYS, then needs premium."""
+    now = time.time()
+    row = run("SELECT biz_trial_start, premium, premium_until FROM access WHERE user_id=?", (user_id,), "one")
+    if not row:
+        run("INSERT INTO access(user_id, biz_trial_start, premium, premium_until) VALUES(?,?,?,?)", (user_id, now, 0, 0))
+        return True, TRIAL_DAYS
+    start = row[0] or now
+    premium = row[1] or 0
+    until = row[2] or 0
+    if premium == 1 and (until == 0 or until > now):
+        return True, 9999
+    used_days = (now - start) / 86400.0
+    left = TRIAL_DAYS - int(used_days)
+    return (used_days <= TRIAL_DAYS), max(0, left)
 
 def hashpw(email, pw, salt):
     return hashlib.sha256(f"{email.lower()}:{pw}:{salt}".encode()).hexdigest()
@@ -260,8 +279,31 @@ def feature_requests():
     return {"requests": [{"name": r[0], "request": r[1], "status": r[2],
                           "when": _dt.datetime.fromtimestamp(r[3]).strftime("%Y-%m-%d %H:%M")} for r in rows]}
 
+@app.get("/access_status")
+def access_status(user_id: str = "default"):
+    allowed, days_left = check_business_access(user_id)
+    return {"business_allowed": allowed, "trial_days_left": days_left, "locked": not allowed}
+
+@app.post("/grant_premium")
+def grant_premium(user_id: str = "", key: str = "", days: int = 30):
+    if key != ADMIN_KEY:
+        return {"ok": False, "error": "Wrong admin key."}
+    now = time.time(); until = now + days * 86400
+    row = run("SELECT 1 FROM access WHERE user_id=?", (user_id,), "one")
+    if row:
+        run("UPDATE access SET premium=1, premium_until=? WHERE user_id=?", (until, user_id))
+    else:
+        run("INSERT INTO access(user_id, biz_trial_start, premium, premium_until) VALUES(?,?,?,?)", (user_id, now, 1, until))
+    return {"ok": True, "premium_until_days": days}
+
 @app.post("/chat")
 def chat(inp: ChatIn, bg: BackgroundTasks):
+    # Business AI: 7-day free trial, then must subscribe
+    if inp.mode == "business":
+        allowed, days_left = check_business_access(inp.user_id)
+        if not allowed:
+            return {"reply": "🔒 Your 7-day free Business trial has ended.\n\nSubscribe to keep using Business AI — unlock invoices, marketing, customer replies, pricing and growth tools without limits.",
+                    "locked": True}
     save_message(inp.user_id, "user", inp.message)
     history = get_history(inp.user_id)
     facts = get_facts(inp.user_id)
