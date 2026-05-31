@@ -129,8 +129,11 @@ def ai_reply(messages, mode="general", facts=None, extra=""):
     if not GROQ_API_KEY:
         return "⚠️ Server has no GROQ_API_KEY set. Add it in your hosting dashboard."
     system = MODES.get(mode, MODES["general"])
-    system += (" You are highly capable: you reason step by step, give accurate, detailed, well-structured answers, "
-               "admit when unsure, and tailor responses to the user. Use clear formatting when helpful.")
+    system += (" IMPORTANT STYLE: Talk like a smart, warm, friendly human in a normal chat — natural and conversational, "
+               "the way you'd text a friend. Keep replies fairly short and easy. Do NOT use big bold headings or piles of "
+               "bullet points for normal questions — just talk normally in sentences. Only use lists, steps, or formatting "
+               "when it's genuinely needed (e.g. an invoice, a step-by-step, or a document the user asked for). "
+               "Be accurate, think before answering, and admit when you're unsure. Match the user's energy and language.")
     if facts:
         system += " Things you remember about this user: " + "; ".join(facts) + "."
     if extra:
