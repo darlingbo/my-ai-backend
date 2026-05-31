@@ -20,9 +20,9 @@ from pydantic import BaseModel
 import requests
 
 # ── Config ───────────────────────────────────────────────────────────────────
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 DB_PATH      = os.environ.get("DB_PATH", "memory.db")
 
 app = FastAPI(title="My AI Backend")
