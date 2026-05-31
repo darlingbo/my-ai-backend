@@ -12,7 +12,7 @@ Endpoints:
   GET  /history       conversation history
   POST /clear         clear a user's conversation
 """
-import os, sqlite3, time, json, urllib.parse
+import os, sqlite3, time, json, urllib.parse, hashlib, uuid
 from typing import Optional, List
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,7 +33,11 @@ def db():
     con = sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS messages(user_id TEXT, role TEXT, content TEXT, ts REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS facts(user_id TEXT, fact TEXT, ts REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS users(user_id TEXT, name TEXT, email TEXT UNIQUE, pw TEXT, ts REAL)")
     return con
+
+def hashpw(email, pw):
+    return hashlib.sha256(f"{email.lower()}:{pw}:myai_salt_2026".encode()).hexdigest()
 
 def save_message(user_id, role, content):
     con = db(); con.execute("INSERT INTO messages VALUES(?,?,?,?)", (user_id, role, content, time.time())); con.commit(); con.close()
@@ -91,11 +95,44 @@ class ImageIn(BaseModel):
     width: int = 768
     height: int = 768
 
+class SignupIn(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"status": "online", "service": "My AI Backend", "model": GROQ_MODEL,
             "key_set": bool(GROQ_API_KEY)}
+
+@app.post("/signup")
+def signup(inp: SignupIn):
+    email = inp.email.strip().lower()
+    if not email or not inp.password or not inp.name.strip():
+        return {"ok": False, "error": "Please fill in name, email and password."}
+    con = db()
+    exists = con.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone()
+    if exists:
+        con.close(); return {"ok": False, "error": "That email is already registered. Try logging in."}
+    uid = "u_" + uuid.uuid4().hex[:12]
+    con.execute("INSERT INTO users VALUES(?,?,?,?,?)", (uid, inp.name.strip(), email, hashpw(email, inp.password), time.time()))
+    con.commit(); con.close()
+    return {"ok": True, "user_id": uid, "name": inp.name.strip(), "email": email}
+
+@app.post("/login")
+def login(inp: LoginIn):
+    email = inp.email.strip().lower()
+    con = db()
+    row = con.execute("SELECT user_id, name, pw FROM users WHERE email=?", (email,)).fetchone()
+    con.close()
+    if not row or row[2] != hashpw(email, inp.password):
+        return {"ok": False, "error": "Wrong email or password."}
+    return {"ok": True, "user_id": row[0], "name": row[1], "email": email}
 
 @app.post("/chat")
 def chat(inp: ChatIn):
