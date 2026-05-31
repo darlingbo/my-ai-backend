@@ -12,7 +12,7 @@ Endpoints:
   GET  /history       conversation history
   POST /clear         clear a user's conversation
 """
-import os, sqlite3, time, json, urllib.parse, hashlib, uuid
+import os, sqlite3, time, json, urllib.parse, hashlib, uuid, re
 from typing import Optional, List
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,7 +34,23 @@ def db():
     con.execute("CREATE TABLE IF NOT EXISTS messages(user_id TEXT, role TEXT, content TEXT, ts REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS facts(user_id TEXT, fact TEXT, ts REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS users(user_id TEXT, name TEXT, email TEXT UNIQUE, pw TEXT, ts REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS knowledge(user_id TEXT, chunk TEXT, source TEXT, ts REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS requests(user_id TEXT, name TEXT, request TEXT, status TEXT, ts REAL)")
     return con
+
+def relevant_knowledge(user_id, msg, limit=4):
+    con = db()
+    rows = con.execute("SELECT chunk FROM knowledge WHERE user_id=?", (user_id,)).fetchall()
+    con.close()
+    chunks = [r[0] for r in rows]
+    if not chunks:
+        return ""
+    words = set(re.findall(r"\w+", msg.lower()))
+    scored = sorted(chunks, key=lambda c: len(words & set(re.findall(r"\w+", c.lower()))), reverse=True)
+    top = [c for c in scored[:limit] if len(words & set(re.findall(r"\w+", c.lower()))) > 0]
+    if not top:
+        top = chunks[-limit:]  # fallback: most recent knowledge
+    return "\n---\n".join(top)
 
 def hashpw(email, pw):
     return hashlib.sha256(f"{email.lower()}:{pw}:myai_salt_2026".encode()).hexdigest()
@@ -146,6 +162,16 @@ class LoginIn(BaseModel):
     email: str
     password: str
 
+class TeachIn(BaseModel):
+    user_id: str = "default"
+    text: str
+    source: str = "note"
+
+class RequestIn(BaseModel):
+    user_id: str = "default"
+    name: str = ""
+    request: str
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -176,6 +202,47 @@ def login(inp: LoginIn):
         return {"ok": False, "error": "Wrong email or password."}
     return {"ok": True, "user_id": row[0], "name": row[1], "email": email}
 
+@app.post("/teach")
+def teach(inp: TeachIn):
+    text = inp.text.strip()
+    if not text:
+        return {"ok": False, "error": "Nothing to add."}
+    chunks = [text[i:i+600] for i in range(0, len(text), 600)]
+    con = db()
+    for c in chunks:
+        if c.strip():
+            con.execute("INSERT INTO knowledge VALUES(?,?,?,?)", (inp.user_id, c.strip(), inp.source, time.time()))
+    con.commit(); con.close()
+    return {"ok": True, "chunks": len(chunks)}
+
+@app.get("/knowledge")
+def knowledge(user_id: str = "default"):
+    con = db()
+    rows = con.execute("SELECT chunk, source FROM knowledge WHERE user_id=? ORDER BY ts DESC", (user_id,)).fetchall()
+    con.close()
+    return {"items": [{"text": r[0], "source": r[1]} for r in rows]}
+
+@app.post("/forget_knowledge")
+def forget_knowledge(user_id: str = "default"):
+    con = db(); con.execute("DELETE FROM knowledge WHERE user_id=?", (user_id,)); con.commit(); con.close()
+    return {"ok": True}
+
+@app.post("/feature_request")
+def feature_request(inp: RequestIn):
+    con = db()
+    con.execute("INSERT INTO requests VALUES(?,?,?,?,?)", (inp.user_id, inp.name, inp.request, "new", time.time()))
+    con.commit(); con.close()
+    return {"ok": True}
+
+@app.get("/feature_requests")
+def feature_requests():
+    con = db()
+    rows = con.execute("SELECT name, request, status, ts FROM requests ORDER BY ts DESC LIMIT 100").fetchall()
+    con.close()
+    import datetime as _dt
+    return {"requests": [{"name": r[0], "request": r[1], "status": r[2],
+                          "when": _dt.datetime.fromtimestamp(r[3]).strftime("%Y-%m-%d %H:%M")} for r in rows]}
+
 @app.post("/chat")
 def chat(inp: ChatIn, bg: BackgroundTasks):
     save_message(inp.user_id, "user", inp.message)
@@ -187,6 +254,10 @@ def chat(inp: ChatIn, bg: BackgroundTasks):
         wc = web_context(inp.message)
         if wc:
             extra = ("\n\nLive web info (use it, and mention it's from a quick web search):\n\"\"\"" + wc + "\"\"\"")
+    # The user's own taught knowledge
+    kb = relevant_knowledge(inp.user_id, inp.message)
+    if kb:
+        extra += ("\n\nThe user taught you this knowledge — use it if relevant:\n\"\"\"" + kb + "\"\"\"")
     reply = ai_reply(history, inp.mode, facts, extra)
     save_message(inp.user_id, "assistant", reply)
     # Learn about the user automatically, after responding (no delay to the reply)
