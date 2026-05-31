@@ -14,7 +14,7 @@ Endpoints:
 """
 import os, sqlite3, time, json, urllib.parse, hashlib, uuid
 from typing import Optional, List
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
@@ -65,20 +65,62 @@ MODES = {
                  "Always give output the user can copy and send right away."),
 }
 
-def ai_reply(messages, mode="general", facts=None):
+def ai_reply(messages, mode="general", facts=None, extra=""):
     if not GROQ_API_KEY:
         return "⚠️ Server has no GROQ_API_KEY set. Add it in your hosting dashboard."
     system = MODES.get(mode, MODES["general"])
+    system += (" You are highly capable: you reason step by step, give accurate, detailed, well-structured answers, "
+               "admit when unsure, and tailor responses to the user. Use clear formatting when helpful.")
     if facts:
         system += " Things you remember about this user: " + "; ".join(facts) + "."
+    if extra:
+        system += extra
     payload = {"model": GROQ_MODEL, "messages": [{"role": "system", "content": system}] + messages[-16:],
-               "max_tokens": 1024, "temperature": 0.7}
+               "max_tokens": 1500, "temperature": 0.7}
     try:
         r = requests.post(GROQ_URL, json=payload,
                           headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=60)
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"(AI error: {e})"
+
+# ── Advanced: live web knowledge ──
+def needs_web(msg):
+    m = msg.lower()
+    keys = ["latest","today","current","news","2025","2026","price of","stock","who is","who won",
+            "what happened","recent","right now","this year","this week","update on","weather","score",
+            "how much is","exchange rate","when is","release date"]
+    return any(k in m for k in keys)
+
+def web_context(query):
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as d:
+            res = list(d.text(query, max_results=5))
+        joined = "\n".join(f"- {r.get('title','')}: {r.get('body','')[:200]}" for r in res if r.get("body"))
+        return joined
+    except Exception:
+        return ""
+
+# ── Advanced: automatic long-term memory ──
+def auto_remember(user_id, user_msg, ai_reply_text):
+    try:
+        prompt = (f"From this exchange, extract 0-2 SHORT durable facts worth remembering about the user "
+                  f"(name, preferences, job, goals, location, important personal details). "
+                  f"If nothing important, reply exactly NONE. Otherwise one fact per line, no numbering.\n\n"
+                  f"User: {user_msg}\nAI: {ai_reply_text}")
+        out = ai_reply([{"role": "user", "content": prompt}], "general")
+        if not out or out.strip().upper().startswith("NONE"):
+            return
+        existing = set(f.lower() for f in get_facts(user_id))
+        con = db()
+        for line in out.splitlines():
+            fact = line.strip("-• ").strip()
+            if len(fact) > 4 and fact.lower() not in existing:
+                con.execute("INSERT INTO facts VALUES(?,?,?)", (user_id, fact, time.time()))
+        con.commit(); con.close()
+    except Exception:
+        pass
 
 # ── Request models ────────────────────────────────────────────────────────────
 class ChatIn(BaseModel):
@@ -135,12 +177,20 @@ def login(inp: LoginIn):
     return {"ok": True, "user_id": row[0], "name": row[1], "email": email}
 
 @app.post("/chat")
-def chat(inp: ChatIn):
+def chat(inp: ChatIn, bg: BackgroundTasks):
     save_message(inp.user_id, "user", inp.message)
     history = get_history(inp.user_id)
     facts = get_facts(inp.user_id)
-    reply = ai_reply(history, inp.mode, facts)
+    # Live web knowledge when the question needs current info
+    extra = ""
+    if needs_web(inp.message):
+        wc = web_context(inp.message)
+        if wc:
+            extra = ("\n\nLive web info (use it, and mention it's from a quick web search):\n\"\"\"" + wc + "\"\"\"")
+    reply = ai_reply(history, inp.mode, facts, extra)
     save_message(inp.user_id, "assistant", reply)
+    # Learn about the user automatically, after responding (no delay to the reply)
+    bg.add_task(auto_remember, inp.user_id, inp.message, reply)
     return {"reply": reply}
 
 @app.post("/remember")
