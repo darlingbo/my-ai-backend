@@ -7,8 +7,11 @@ Uses PostgreSQL (permanent) when DATABASE_URL is set, else SQLite (local dev).
 import os, sqlite3, time, json, urllib.parse, hashlib, uuid, re
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import requests
+
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "DARLINGBO2026")
 
 # ── Config ───────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
@@ -309,3 +312,108 @@ def search(q: str, n: int = 5):
         return {"results": results}
     except Exception as e:
         return {"results": [], "error": str(e)}
+
+# ── Admin data (protected) ────────────────────────────────────────────────────
+@app.get("/admin_data")
+def admin_data(key: str = ""):
+    if key != ADMIN_KEY:
+        return {"ok": False, "error": "Wrong admin key."}
+    ucount = (run("SELECT COUNT(*) FROM users", (), "one") or [0])[0]
+    mcount = (run("SELECT COUNT(*) FROM messages", (), "one") or [0])[0]
+    users = run("SELECT name, email, ts FROM users ORDER BY ts DESC LIMIT 200", (), "all") or []
+    reqs = run("SELECT name, request, status, ts FROM requests ORDER BY ts DESC LIMIT 100", (), "all") or []
+    import datetime as _dt
+    return {"ok": True, "user_count": ucount, "message_count": mcount,
+            "users": [{"name": u[0], "email": u[1], "joined": _dt.datetime.fromtimestamp(u[2]).strftime("%Y-%m-%d")} for u in users],
+            "requests": [{"name": r[0], "request": r[1], "status": r[2],
+                          "when": _dt.datetime.fromtimestamp(r[3]).strftime("%Y-%m-%d %H:%M")} for r in reqs]}
+
+# ── Admin dashboard (web page) ────────────────────────────────────────────────
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    return """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>My AI — Admin</title><style>
+body{font-family:system-ui,Arial;background:#0b0f1a;color:#e6eeff;margin:0;padding:18px}
+h1{color:#3be0ff}.card{background:#141d38;border:1px solid #2a3a66;border-radius:12px;padding:14px;margin:10px 0}
+input,button{padding:10px;border-radius:8px;border:1px solid #2a3a66;background:#0f1730;color:#e6eeff;font-size:15px}
+button{background:#3be0ff;color:#06121f;border:none;font-weight:700;cursor:pointer}
+.stat{display:inline-block;background:#0f1730;border-radius:10px;padding:12px 18px;margin:6px;text-align:center}
+.stat b{font-size:1.6rem;color:#3be0ff;display:block}
+table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;padding:7px;border-bottom:1px solid #1e2a4a}
+</style></head><body>
+<h1>👑 My AI — Admin Dashboard</h1>
+<div class=card><input id=k type=password placeholder="Admin key"> <button onclick=load()>Open</button></div>
+<div id=out></div>
+<script>
+async function load(){
+ const key=document.getElementById('k').value;
+ const r=await fetch('/admin_data?key='+encodeURIComponent(key));const d=await r.json();
+ if(!d.ok){document.getElementById('out').innerHTML='<div class=card>❌ '+d.error+'</div>';return;}
+ let h='<div class=card><span class=stat><b>'+d.user_count+'</b>Users</span><span class=stat><b>'+d.message_count+'</b>Messages</span><span class=stat><b>'+d.requests.length+'</b>Requests</span></div>';
+ h+='<div class=card><h3>👥 Users</h3><table><tr><th>Name</th><th>Email</th><th>Joined</th></tr>';
+ d.users.forEach(u=>h+='<tr><td>'+u.name+'</td><td>'+u.email+'</td><td>'+u.joined+'</td></tr>');
+ h+='</table></div><div class=card><h3>📝 Feature Requests</h3>';
+ if(!d.requests.length)h+='None yet.';
+ d.requests.forEach(x=>h+='<div style="border-bottom:1px solid #1e2a4a;padding:6px 0">• '+x.request+' <small style=color:#7c8ab0>('+x.name+', '+x.when+')</small></div>');
+ h+='</div>';
+ document.getElementById('out').innerHTML=h;
+}
+</script></body></html>"""
+
+# ── Website chat app (works in any browser) ───────────────────────────────────
+@app.get("/web", response_class=HTMLResponse)
+def web_app():
+    return """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>My AI</title><style>
+*{box-sizing:border-box}body{font-family:system-ui,Arial;background:#0b0f1a;color:#e6eeff;margin:0;height:100vh;display:flex;flex-direction:column}
+#top{padding:12px 16px;border-bottom:1px solid #1e2a4a;display:flex;align-items:center;gap:10px}
+#top b{color:#3be0ff;font-size:1.2rem}select{margin-left:auto;background:#0f1730;color:#e6eeff;border:1px solid #2a3a66;border-radius:8px;padding:6px}
+#msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.b{max-width:80%;padding:10px 14px;border-radius:14px;line-height:1.5;white-space:pre-wrap}
+.u{align-self:flex-end;background:linear-gradient(135deg,#3be0ff,#6b8cff);color:#06121f;border-bottom-right-radius:4px}
+.a{align-self:flex-start;background:#172241;border:1px solid #2a3a66;border-bottom-left-radius:4px}
+#bar{display:flex;gap:8px;padding:12px;border-top:1px solid #1e2a4a}
+#in{flex:1;padding:12px;border-radius:12px;border:1px solid #2a3a66;background:#0f1730;color:#e6eeff;font-size:15px}
+#send{padding:12px 18px;border:none;border-radius:12px;background:linear-gradient(135deg,#3be0ff,#6b8cff);color:#06121f;font-weight:700;cursor:pointer}
+.auth{max-width:360px;margin:8vh auto;padding:20px}.auth input{width:100%;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #2a3a66;background:#0f1730;color:#e6eeff}
+.auth button{width:100%;padding:13px;border:none;border-radius:10px;background:linear-gradient(135deg,#3be0ff,#6b8cff);color:#06121f;font-weight:700;font-size:16px;cursor:pointer}
+a{color:#3be0ff;cursor:pointer}
+</style></head><body>
+<div id=app></div>
+<script>
+const API='';let uid=localStorage.getItem('uid'),uname=localStorage.getItem('uname'),mode='general',signup=true;
+function esc(s){return (s||'').replace(/</g,'&lt;')}
+function render(){
+ if(!uid){document.getElementById('app').innerHTML=
+  `<div class=auth><h1 style=color:#3be0ff>🤖 My AI</h1>
+   <div id=nameRow><input id=nm placeholder="Your name"></div>
+   <input id=em placeholder="Email"><input id=pw type=password placeholder="Password">
+   <button onclick=auth()>${signup?'Sign Up':'Log In'}</button>
+   <p><a onclick=tog()>${signup?'Have an account? Log in':'New? Create account'}</a></p></div>`;
+  document.getElementById('nameRow').style.display=signup?'block':'none';return;}
+ document.getElementById('app').innerHTML=
+  `<div id=top><b>🤖 My AI</b>
+    <select id=mode onchange="mode=this.value">
+     <option value=general>💬 Daily</option><option value=student>🎓 Student</option><option value=business>💼 Business</option>
+    </select></div>
+   <div id=msgs></div>
+   <div id=bar><input id=in placeholder="Message…" onkeydown="if(event.key==='Enter')send()"><button id=send onclick=send()>➤</button></div>`;
+ add('a','Hi '+(uname||'')+'! I remember our past chats. How can I help?');loadHist();
+}
+function tog(){signup=!signup;render()}
+function add(c,t){const m=document.getElementById('msgs');const d=document.createElement('div');d.className='b '+c;d.textContent=t;m.appendChild(d);m.scrollTop=m.scrollHeight;return d}
+async function auth(){
+ const e=em.value.trim(),p=pw.value,n=(document.getElementById('nm')||{}).value||'';
+ const r=await fetch(API+'/'+(signup?'signup':'login'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,email:e,password:p})});
+ const d=await r.json();if(!d.ok){alert(d.error);return;}
+ uid=d.user_id;uname=d.name;localStorage.setItem('uid',uid);localStorage.setItem('uname',uname);render();
+}
+async function loadHist(){try{const r=await fetch(API+'/history?user_id='+uid);const d=await r.json();(d.history||[]).forEach(m=>add(m.role==='user'?'u':'a',m.content));}catch(e){}}
+async function send(){
+ const t=document.getElementById('in').value.trim();if(!t)return;document.getElementById('in').value='';add('u',t);
+ const th=add('a','…');
+ try{const r=await fetch(API+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid,message:t,mode:mode})});
+ const d=await r.json();th.textContent=d.reply;}catch(e){th.textContent='Connection error.';}
+}
+render();
+</script></body></html>"""
