@@ -5,13 +5,17 @@ Architecture:  User → App → THIS SERVER → AI Model + Memory + Tools
 Uses PostgreSQL (permanent) when DATABASE_URL is set, else SQLite (local dev).
 """
 import os, sqlite3, time, json, urllib.parse, hashlib, uuid, re
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import requests
 
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "DARLINGBO2026")
+PAYSTACK_SECRET = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
+PAY_AMOUNT   = int(os.environ.get("PAY_AMOUNT", "2000"))   # 2000 pesewas = GH₵20
+PAY_CURRENCY = os.environ.get("PAY_CURRENCY", "GHS")
+PAY_DAYS     = int(os.environ.get("PAY_DAYS", "30"))       # premium length per payment
 
 # ── Config ───────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
@@ -74,6 +78,13 @@ def check_business_access(user_id):
     used_days = (now - start) / 86400.0
     left = TRIAL_DAYS - int(used_days)
     return (used_days <= TRIAL_DAYS), max(0, left)
+
+def make_premium(user_id, days=PAY_DAYS):
+    now = time.time(); until = now + days * 86400
+    if run("SELECT 1 FROM access WHERE user_id=?", (user_id,), "one"):
+        run("UPDATE access SET premium=1, premium_until=? WHERE user_id=?", (until, user_id))
+    else:
+        run("INSERT INTO access(user_id, biz_trial_start, premium, premium_until) VALUES(?,?,?,?)", (user_id, now, 1, until))
 
 def hashpw(email, pw, salt):
     return hashlib.sha256(f"{email.lower()}:{pw}:{salt}".encode()).hexdigest()
@@ -288,13 +299,58 @@ def access_status(user_id: str = "default"):
 def grant_premium(user_id: str = "", key: str = "", days: int = 30):
     if key != ADMIN_KEY:
         return {"ok": False, "error": "Wrong admin key."}
-    now = time.time(); until = now + days * 86400
-    row = run("SELECT 1 FROM access WHERE user_id=?", (user_id,), "one")
-    if row:
-        run("UPDATE access SET premium=1, premium_until=? WHERE user_id=?", (until, user_id))
-    else:
-        run("INSERT INTO access(user_id, biz_trial_start, premium, premium_until) VALUES(?,?,?,?)", (user_id, now, 1, until))
+    make_premium(user_id, days)
     return {"ok": True, "premium_until_days": days}
+
+class PayStartIn(BaseModel):
+    user_id: str
+    email: str
+
+@app.post("/pay/start")
+def pay_start(inp: PayStartIn):
+    if not PAYSTACK_SECRET:
+        return {"ok": False, "error": "Payments not set up yet. Add PAYSTACK_SECRET_KEY on the server."}
+    try:
+        r = requests.post("https://api.paystack.co/transaction/initialize",
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET}", "Content-Type": "application/json"},
+            json={"email": inp.email or f"{inp.user_id}@myai.app",
+                  "amount": PAY_AMOUNT, "currency": PAY_CURRENCY,
+                  "metadata": {"user_id": inp.user_id}}, timeout=30)
+        d = r.json()
+        if d.get("status"):
+            return {"ok": True, "url": d["data"]["authorization_url"], "reference": d["data"]["reference"]}
+        return {"ok": False, "error": d.get("message", "Could not start payment.")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/pay/verify")
+def pay_verify(reference: str = "", user_id: str = ""):
+    if not PAYSTACK_SECRET:
+        return {"ok": False, "error": "Payments not set up."}
+    try:
+        r = requests.get(f"https://api.paystack.co/transaction/verify/{reference}",
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET}"}, timeout=30)
+        d = r.json()
+        if d.get("status") and d["data"].get("status") == "success":
+            uid = d["data"].get("metadata", {}).get("user_id") or user_id
+            if uid:
+                make_premium(uid)
+            return {"ok": True, "premium": True}
+        return {"ok": False, "error": "Payment not completed yet."}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/paystack/webhook")
+async def paystack_webhook(request: Request):
+    try:
+        body = await request.json()
+        if body.get("event") == "charge.success":
+            uid = body.get("data", {}).get("metadata", {}).get("user_id")
+            if uid:
+                make_premium(uid)
+    except Exception:
+        pass
+    return {"ok": True}
 
 @app.post("/chat")
 def chat(inp: ChatIn, bg: BackgroundTasks):
