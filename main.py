@@ -33,7 +33,7 @@ def db():
     con = sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS messages(user_id TEXT, role TEXT, content TEXT, ts REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS facts(user_id TEXT, fact TEXT, ts REAL)")
-    con.execute("CREATE TABLE IF NOT EXISTS users(user_id TEXT, name TEXT, email TEXT UNIQUE, pw TEXT, ts REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS users(user_id TEXT, name TEXT, email TEXT UNIQUE, pw TEXT, salt TEXT, recovery TEXT, ts REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS knowledge(user_id TEXT, chunk TEXT, source TEXT, ts REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS requests(user_id TEXT, name TEXT, request TEXT, status TEXT, ts REAL)")
     return con
@@ -52,8 +52,8 @@ def relevant_knowledge(user_id, msg, limit=4):
         top = chunks[-limit:]  # fallback: most recent knowledge
     return "\n---\n".join(top)
 
-def hashpw(email, pw):
-    return hashlib.sha256(f"{email.lower()}:{pw}:myai_salt_2026".encode()).hexdigest()
+def hashpw(email, pw, salt):
+    return hashlib.sha256(f"{email.lower()}:{pw}:{salt}".encode()).hexdigest()
 
 def save_message(user_id, role, content):
     con = db(); con.execute("INSERT INTO messages VALUES(?,?,?,?)", (user_id, role, content, time.time())); con.commit(); con.close()
@@ -157,10 +157,22 @@ class SignupIn(BaseModel):
     name: str
     email: str
     password: str
+    recovery: str = ""   # recovery word for password reset
 
 class LoginIn(BaseModel):
     email: str
     password: str
+
+class ResetIn(BaseModel):
+    email: str
+    recovery: str
+    new_password: str
+
+class VisionIn(BaseModel):
+    user_id: str = "default"
+    image_b64: str
+    question: str = "What's in this image?"
+    mode: str = "general"
 
 class TeachIn(BaseModel):
     user_id: str = "default"
@@ -188,7 +200,10 @@ def signup(inp: SignupIn):
     if exists:
         con.close(); return {"ok": False, "error": "That email is already registered. Try logging in."}
     uid = "u_" + uuid.uuid4().hex[:12]
-    con.execute("INSERT INTO users VALUES(?,?,?,?,?)", (uid, inp.name.strip(), email, hashpw(email, inp.password), time.time()))
+    salt = uuid.uuid4().hex
+    rec = hashpw(email, inp.recovery.strip().lower(), salt) if inp.recovery.strip() else ""
+    con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)",
+                (uid, inp.name.strip(), email, hashpw(email, inp.password, salt), salt, rec, time.time()))
     con.commit(); con.close()
     return {"ok": True, "user_id": uid, "name": inp.name.strip(), "email": email}
 
@@ -196,11 +211,49 @@ def signup(inp: SignupIn):
 def login(inp: LoginIn):
     email = inp.email.strip().lower()
     con = db()
-    row = con.execute("SELECT user_id, name, pw FROM users WHERE email=?", (email,)).fetchone()
+    row = con.execute("SELECT user_id, name, pw, salt FROM users WHERE email=?", (email,)).fetchone()
     con.close()
-    if not row or row[2] != hashpw(email, inp.password):
+    if not row or row[2] != hashpw(email, inp.password, row[3]):
         return {"ok": False, "error": "Wrong email or password."}
     return {"ok": True, "user_id": row[0], "name": row[1], "email": email}
+
+@app.post("/reset_password")
+def reset_password(inp: ResetIn):
+    email = inp.email.strip().lower()
+    con = db()
+    row = con.execute("SELECT user_id, salt, recovery FROM users WHERE email=?", (email,)).fetchone()
+    if not row:
+        con.close(); return {"ok": False, "error": "No account with that email."}
+    uid, salt, rec = row
+    if not rec:
+        con.close(); return {"ok": False, "error": "This account has no recovery word set. Contact the creator."}
+    if rec != hashpw(email, inp.recovery.strip().lower(), salt):
+        con.close(); return {"ok": False, "error": "Wrong recovery word."}
+    con.execute("UPDATE users SET pw=? WHERE email=?", (hashpw(email, inp.new_password, salt), email))
+    con.commit(); con.close()
+    return {"ok": True, "message": "Password reset. You can log in now."}
+
+@app.post("/vision")
+def vision(inp: VisionIn):
+    if not GROQ_API_KEY:
+        return {"reply": "Server has no API key set."}
+    data_uri = inp.image_b64 if inp.image_b64.startswith("data:") else f"data:image/jpeg;base64,{inp.image_b64}"
+    payload = {
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": inp.question},
+            {"type": "image_url", "image_url": {"url": data_uri}}
+        ]}],
+        "max_tokens": 1024
+    }
+    try:
+        r = requests.post(GROQ_URL, json=payload, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=90)
+        reply = r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        reply = f"(Vision error: {e})"
+    save_message(inp.user_id, "user", f"[sent a photo] {inp.question}")
+    save_message(inp.user_id, "assistant", reply)
+    return {"reply": reply}
 
 @app.post("/teach")
 def teach(inp: TeachIn):
