@@ -134,6 +134,11 @@ def ai_reply(messages, mode="general", facts=None, extra=""):
     if not GROQ_API_KEY:
         return "⚠️ Server has no GROQ_API_KEY set. Add it in your hosting dashboard."
     system = MODES.get(mode, MODES["general"])
+    system += (" LOCAL CONTEXT: The user is likely in Ghana / West Africa. When relevant, be aware of: Mobile Money "
+               "(MoMo — MTN, Telecel, AirtelTigo), currency GH₵ (Ghana cedis), local cities (Accra, Kumasi, Takoradi, Tamale), "
+               "and local life and food. For students: Ghana's education system (BECE, WASSCE/WAEC, SHS, and universities like "
+               "Legon/UG, KNUST, UCC). For business: small shops, market trading, and Mobile Money payments are common. "
+               "Use this local awareness naturally ONLY when it fits — never force it, and still help with anything worldwide.")
     system += (" IMPORTANT STYLE: Talk like a smart, warm, friendly human in a normal chat — natural and conversational, "
                "the way you'd text a friend. Keep replies fairly short and easy. Do NOT use big bold headings or piles of "
                "bullet points for normal questions — just talk normally in sentences. Only use lists, steps, or formatting "
