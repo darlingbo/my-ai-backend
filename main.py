@@ -242,9 +242,12 @@ def status():
 @app.get("/", response_class=HTMLResponse)
 def landing():
     apk = "https://github.com/darlingbo/my-ai-app/releases/latest/download/MyAI.apk"
+    logo = ("https://image.pollinations.ai/prompt/futuristic%20AI%20robot%20head%20emblem%20logo%2C"
+            "%20glowing%20blue%20digital%20brain%2C%20circuit%20board%20lines%2C%20metallic%20silver%20and%20blue%2C"
+            "%20black%20background%2C%20centered%20badge%2C%20sharp%2C%20high%20detail?width=512&height=512&nologo=true&seed=77")
     return """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>My AI — Your Personal AI Assistant</title>
+<title>Aura — Your AI Assistant</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,Arial;background:#0B0F1A;color:#E6EEFF;text-align:center;line-height:1.6}
@@ -265,8 +268,8 @@ footer{color:#56627F;font-size:13px;padding:30px}
 .note{color:#7C8AB0;font-size:13px;margin-top:10px}
 </style></head><body>
 <div class=hero>
-  <div class=logo>🤖</div>
-  <h1>My AI</h1>
+  <img src="%LOGO%" alt="Aura" style="width:130px;height:130px;border-radius:28px;box-shadow:0 0 40px rgba(59,224,255,.4)">
+  <h1>Aura</h1>
   <p class=tag>Your own AI assistant — chat, build websites, make invoices, do homework, draw images, and more. Works for students, business, and everyday life. 🇬🇭</p>
   <a class="btn dl" href="%APK%">📲 Download App</a>
   <a class="btn try" href="/web">💻 Try in Browser</a>
@@ -289,8 +292,8 @@ footer{color:#56627F;font-size:13px;padding:30px}
 <li>Open the app, sign up, and start chatting!</li>
 </ol>
 </div>
-<footer>Made in Ghana 🇬🇭 · Powered by My AI</footer>
-</body></html>""".replace("%APK%", apk)
+<footer>Made in Ghana 🇬🇭 · Powered by Aura</footer>
+</body></html>""".replace("%APK%", apk).replace("%LOGO%", logo)
 
 @app.post("/signup")
 def signup(inp: SignupIn):
