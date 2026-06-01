@@ -58,6 +58,9 @@ def init_db():
     run("CREATE TABLE IF NOT EXISTS knowledge(user_id TEXT, chunk TEXT, source TEXT, ts DOUBLE PRECISION)")
     run("CREATE TABLE IF NOT EXISTS requests(user_id TEXT, name TEXT, request TEXT, status TEXT, ts DOUBLE PRECISION)")
     run("CREATE TABLE IF NOT EXISTS access(user_id TEXT, biz_trial_start DOUBLE PRECISION, premium INTEGER, premium_until DOUBLE PRECISION)")
+    # multiple conversations per user (ChatGPT-style)
+    try: run("ALTER TABLE messages ADD COLUMN conv_id TEXT")
+    except Exception: pass
 
 init_db()
 
@@ -89,11 +92,13 @@ def make_premium(user_id, days=PAY_DAYS):
 def hashpw(email, pw, salt):
     return hashlib.sha256(f"{email.lower()}:{pw}:{salt}".encode()).hexdigest()
 
-def save_message(user_id, role, content):
-    run("INSERT INTO messages VALUES(?,?,?,?)", (user_id, role, content, time.time()))
+def save_message(user_id, role, content, conv_id="default"):
+    run("INSERT INTO messages(user_id, role, content, ts, conv_id) VALUES(?,?,?,?,?)",
+        (user_id, role, content, time.time(), conv_id))
 
-def get_history(user_id, limit=20):
-    rows = run("SELECT role, content FROM messages WHERE user_id=? ORDER BY ts DESC LIMIT ?", (user_id, limit), "all") or []
+def get_history(user_id, conv_id="default", limit=50):
+    rows = run("SELECT role, content FROM messages WHERE user_id=? AND conv_id=? ORDER BY ts DESC LIMIT ?",
+               (user_id, conv_id, limit), "all") or []
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 def get_facts(user_id):
@@ -181,7 +186,7 @@ def auto_remember(user_id, user_msg, ai_reply_text):
 
 # ── Request models ────────────────────────────────────────────────────────────
 class ChatIn(BaseModel):
-    user_id: str = "default"; message: str; mode: str = "general"
+    user_id: str = "default"; message: str; mode: str = "general"; conv_id: str = "default"
 class RememberIn(BaseModel):
     user_id: str = "default"; fact: str
 class ImageIn(BaseModel):
@@ -363,8 +368,8 @@ def chat(inp: ChatIn, bg: BackgroundTasks):
         if not allowed:
             return {"reply": "🔒 Your 7-day free Business trial has ended.\n\nSubscribe to keep using Business AI — unlock invoices, marketing, customer replies, pricing and growth tools without limits.",
                     "locked": True}
-    save_message(inp.user_id, "user", inp.message)
-    history = get_history(inp.user_id)
+    save_message(inp.user_id, "user", inp.message, inp.conv_id)
+    history = get_history(inp.user_id, inp.conv_id)
     facts = get_facts(inp.user_id)
     extra = ""
     if needs_web(inp.message):
@@ -375,7 +380,7 @@ def chat(inp: ChatIn, bg: BackgroundTasks):
     if kb:
         extra += ("\n\nThe user taught you this knowledge — use it if relevant:\n\"\"\"" + kb + "\"\"\"")
     reply = ai_reply(history, inp.mode, facts, extra)
-    save_message(inp.user_id, "assistant", reply)
+    save_message(inp.user_id, "assistant", reply, inp.conv_id)
     bg.add_task(auto_remember, inp.user_id, inp.message, reply)
     return {"reply": reply}
 
@@ -389,8 +394,20 @@ def memories(user_id: str = "default"):
     return {"facts": get_facts(user_id)}
 
 @app.get("/history")
-def history(user_id: str = "default"):
-    return {"history": get_history(user_id, 50)}
+def history(user_id: str = "default", conv_id: str = "default"):
+    return {"history": get_history(user_id, conv_id, 80)}
+
+@app.get("/conversations")
+def conversations(user_id: str = "default"):
+    rows = run("SELECT conv_id, MAX(ts) FROM messages WHERE user_id=? AND conv_id IS NOT NULL GROUP BY conv_id ORDER BY MAX(ts) DESC LIMIT 50",
+               (user_id,), "all") or []
+    out = []
+    for conv_id, _last in rows:
+        t = run("SELECT content FROM messages WHERE user_id=? AND conv_id=? AND role='user' ORDER BY ts LIMIT 1",
+                (user_id, conv_id), "one")
+        title = (t[0][:42] if t and t[0] else "New chat")
+        out.append({"conv_id": conv_id, "title": title})
+    return {"conversations": out}
 
 @app.post("/clear")
 def clear(user_id: str = "default"):
