@@ -156,6 +156,19 @@ def ai_reply(messages, mode="general", facts=None, extra=""):
     except Exception as e:
         return f"(AI error: {e})"
 
+def ai_raw(system, user_msg, max_tokens=6000):
+    """Call the model with a custom system prompt (used by the website/app builder)."""
+    if not GROQ_API_KEY:
+        return "<!-- no API key -->"
+    payload = {"model": GROQ_MODEL,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
+               "max_tokens": max_tokens, "temperature": 0.4}
+    try:
+        r = requests.post(GROQ_URL, json=payload, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=120)
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"<!-- error: {e} -->"
+
 def needs_web(msg):
     m = msg.lower()
     keys = ["latest","today","current","news","2025","2026","price of","stock","who is","who won",
@@ -208,6 +221,9 @@ class TeachIn(BaseModel):
     user_id: str = "default"; text: str; source: str = "note"
 class RequestIn(BaseModel):
     user_id: str = "default"; name: str = ""; request: str
+
+class BuildIn(BaseModel):
+    prompt: str
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
@@ -418,6 +434,21 @@ def conversations(user_id: str = "default"):
 def clear(user_id: str = "default"):
     run("DELETE FROM messages WHERE user_id=?", (user_id,))
     return {"ok": True}
+
+@app.post("/build")
+def build(inp: BuildIn):
+    system = ("You are an expert web developer. Build a COMPLETE, single self-contained HTML file "
+              "(HTML + CSS inside <style> + JavaScript inside <script>) that fully works on its own in a browser, "
+              "based on the user's request. Make it modern, clean, mobile-friendly and colorful. "
+              "Include everything in ONE file. Return ONLY the raw HTML code starting with <!DOCTYPE html> — "
+              "no explanations and no markdown code fences.")
+    code = ai_raw(system, inp.prompt, max_tokens=7000)
+    # strip accidental markdown fences
+    code = re.sub(r"^```[a-zA-Z]*\s*", "", code.strip())
+    code = re.sub(r"\s*```$", "", code.strip())
+    if "<" not in code:
+        code = f"<!DOCTYPE html><html><body style='font-family:sans-serif;padding:20px'><p>{code}</p></body></html>"
+    return {"code": code}
 
 @app.post("/image")
 def image(inp: ImageIn):
