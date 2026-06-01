@@ -232,10 +232,63 @@ class BuildIn(BaseModel):
     prompt: str
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
-@app.get("/")
-def root():
+@app.get("/status")
+def status():
     return {"status": "online", "service": "My AI Backend", "model": GROQ_MODEL,
             "key_set": bool(GROQ_API_KEY), "database": "postgres (permanent)" if USE_PG else "sqlite (local)"}
+
+@app.get("/", response_class=HTMLResponse)
+def landing():
+    apk = "https://github.com/darlingbo/my-ai-app/releases/latest/download/MyAI.apk"
+    return """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>My AI — Your Personal AI Assistant</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,Arial;background:#0B0F1A;color:#E6EEFF;text-align:center;line-height:1.6}
+.hero{padding:54px 20px 30px;background:radial-gradient(circle at 50% 0%,#172241,#0B0F1A 70%)}
+.logo{font-size:64px}
+h1{font-size:34px;margin:8px 0;color:#3BE0FF;letter-spacing:.5px}
+.tag{color:#9Fb0d0;font-size:17px;max-width:560px;margin:8px auto 26px}
+.btn{display:inline-block;margin:8px;padding:16px 30px;border-radius:14px;font-weight:700;font-size:17px;text-decoration:none}
+.dl{background:linear-gradient(135deg,#3BE0FF,#6B8CFF);color:#06121F}
+.try{background:#172241;color:#3BE0FF;border:1px solid #2a3a66}
+.feats{max-width:780px;margin:30px auto;padding:0 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+.card{background:#141d38;border:1px solid #2a3a66;border-radius:16px;padding:20px;text-align:left}
+.card h3{color:#3BE0FF;font-size:17px;margin-bottom:6px}
+.card p{color:#9Fb0d0;font-size:14px}
+.steps{max-width:560px;margin:20px auto;padding:0 16px;text-align:left;color:#cdd6f0}
+.steps li{margin:8px 0}
+footer{color:#56627F;font-size:13px;padding:30px}
+.note{color:#7C8AB0;font-size:13px;margin-top:10px}
+</style></head><body>
+<div class=hero>
+  <div class=logo>🤖</div>
+  <h1>My AI</h1>
+  <p class=tag>Your own AI assistant — chat, build websites, make invoices, do homework, draw images, and more. Works for students, business, and everyday life. 🇬🇭</p>
+  <a class="btn dl" href="%APK%">📲 Download App</a>
+  <a class="btn try" href="/web">💻 Try in Browser</a>
+  <p class=note>After downloading, tap the file and choose "Install anyway".</p>
+</div>
+<div class=feats>
+  <div class=card><h3>💬 Talk naturally</h3><p>Just ask — no buttons. It understands and responds like a real assistant.</p></div>
+  <div class=card><h3>🛠️ Builds for you</h3><p>"Build me a website" → it creates it live. Plus invoices, marketing, essays.</p></div>
+  <div class=card><h3>🎓 Student mode</h3><p>Explains topics, quizzes you, solves problems, plans your studies. Earn XP!</p></div>
+  <div class=card><h3>💼 Business mode</h3><p>Invoices, customer replies, pricing, marketing — grow your business.</p></div>
+  <div class=card><h3>🎨 Images & photos</h3><p>Create images from words, and analyze photos you send.</p></div>
+  <div class=card><h3>🧠 Remembers you</h3><p>It learns about you over time and keeps your past chats.</p></div>
+</div>
+<div class=steps>
+<b style="color:#3BE0FF">How to install:</b>
+<ol>
+<li>Tap <b>Download App</b> above</li>
+<li>Open the downloaded <b>MyAI.apk</b></li>
+<li>If asked, allow <b>"Install from this source"</b></li>
+<li>Open the app, sign up, and start chatting!</li>
+</ol>
+</div>
+<footer>Made in Ghana 🇬🇭 · Powered by My AI</footer>
+</body></html>""".replace("%APK%", apk)
 
 @app.post("/signup")
 def signup(inp: SignupIn):
