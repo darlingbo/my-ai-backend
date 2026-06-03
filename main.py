@@ -1005,6 +1005,13 @@ def sweep(key: str = ""):
         return {"ok": False, "error": "bad key"}
     return run_sweep()
 
+@app.get("/ops_clear")
+def ops_clear(biz_id: str = "elitedata", key: str = ""):
+    if key != ADMIN_KEY:
+        return {"ok": False, "error": "bad key"}
+    run("DELETE FROM recon WHERE biz_id=?", (biz_id,))
+    return {"ok": True, "cleared": biz_id}
+
 @app.get("/ops/{biz_id}", response_class=HTMLResponse)
 def ops_dashboard(biz_id: str, key: str = ""):
     if key != ADMIN_KEY:
