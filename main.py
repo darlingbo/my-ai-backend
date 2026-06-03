@@ -7,7 +7,7 @@ Uses PostgreSQL (permanent) when DATABASE_URL is set, else SQLite (local dev).
 import os, sqlite3, time, json, urllib.parse, hashlib, uuid, re
 from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 import requests
 
@@ -58,11 +58,35 @@ def init_db():
     run("CREATE TABLE IF NOT EXISTS knowledge(user_id TEXT, chunk TEXT, source TEXT, ts DOUBLE PRECISION)")
     run("CREATE TABLE IF NOT EXISTS requests(user_id TEXT, name TEXT, request TEXT, status TEXT, ts DOUBLE PRECISION)")
     run("CREATE TABLE IF NOT EXISTS access(user_id TEXT, biz_trial_start DOUBLE PRECISION, premium INTEGER, premium_until DOUBLE PRECISION)")
+    # businesses that embed Aura on their own website (e.g. Elite Data)
+    run("CREATE TABLE IF NOT EXISTS biz(biz_id TEXT PRIMARY KEY, name TEXT, info TEXT, greeting TEXT, color TEXT, owner TEXT, ts DOUBLE PRECISION)")
     # multiple conversations per user (ChatGPT-style)
     try: run("ALTER TABLE messages ADD COLUMN conv_id TEXT")
     except Exception: pass
 
 init_db()
+
+def seed_elitedata():
+    """Create the Elite Data business profile if it doesn't exist yet."""
+    if run("SELECT 1 FROM biz WHERE biz_id=?", ("elitedata",), "one"):
+        return
+    info = (
+        "BUSINESS: Elite Data — we sell affordable mobile data bundles in Ghana.\n"
+        "NETWORKS: MTN, Telecel (Vodafone), AirtelTigo.\n"
+        "HOW TO ORDER: Tell the customer to send the NETWORK, the BUNDLE SIZE they want, "
+        "and the PHONE NUMBER to load. Then they pay by Mobile Money and the bundle is sent.\n"
+        "PAYMENT: Mobile Money (MoMo). (Owner: update this with your real MoMo number and exact bundle prices.)\n"
+        "NOTE: Prices and the exact bundle list have NOT been set yet. If a customer asks for a price you "
+        "don't have, say you'll confirm the current price and ask them which network and size they want, "
+        "then collect their order details. Never invent a price."
+    )
+    run("INSERT INTO biz(biz_id, name, info, greeting, color, owner, ts) VALUES(?,?,?,?,?,?,?)",
+        ("elitedata", "Elite Data",
+         info,
+         "Hi! 👋 Welcome to Elite Data. I can help you buy data bundles for MTN, Telecel or AirtelTigo. What do you need?",
+         "#1488CC", "stephenowusuansah601@gmail.com", time.time()))
+
+seed_elitedata()
 
 TRIAL_DAYS = 7
 
@@ -243,6 +267,11 @@ class RequestIn(BaseModel):
 
 class BuildIn(BaseModel):
     prompt: str
+
+class BizChatIn(BaseModel):
+    biz_id: str; message: str; history: list = []
+class BizSetIn(BaseModel):
+    key: str = ""; biz_id: str; name: str = ""; info: str = ""; greeting: str = ""; color: str = ""
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/status")
@@ -541,6 +570,160 @@ def search(q: str, n: int = 5):
         return {"results": results}
     except Exception as e:
         return {"results": [], "error": str(e)}
+
+# ── Aura for Business: embed Aura on a company's own website ───────────────────
+BACKEND_URL = os.environ.get("BACKEND_URL", "https://my-ai-backend-itf0.onrender.com").rstrip("/")
+
+def get_biz(biz_id):
+    row = run("SELECT biz_id, name, info, greeting, color FROM biz WHERE biz_id=?", (biz_id,), "one")
+    if not row:
+        return None
+    return {"biz_id": row[0], "name": row[1], "info": row[2], "greeting": row[3], "color": row[4] or "#1488CC"}
+
+def biz_reply(biz, history, message):
+    """Answer a customer as the business's own assistant, using only the business info."""
+    if not GROQ_API_KEY:
+        return "Sorry, the assistant is not configured yet."
+    system = (
+        f"You are the friendly customer-service assistant for the business '{biz['name']}'. "
+        "You talk to CUSTOMERS on the business's website. Be warm, short, and helpful, like a good shop attendant. "
+        "Use ONLY the business information below to answer about products, prices, and how to order. "
+        "If a price or detail is NOT in the information, do NOT make it up — say you'll confirm it and ask for the "
+        "details you need to take their order. Help the customer step by step and guide them to place an order. "
+        "Keep replies natural and friendly (this is Ghana — Mobile Money, MTN/Telecel/AirtelTigo are normal). "
+        "Never discuss anything unrelated to this business.\n\n"
+        f"=== BUSINESS INFORMATION ===\n{biz['info']}\n=== END ==="
+    )
+    msgs = [{"role": "system", "content": system}]
+    for m in (history or [])[-12:]:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        msgs.append({"role": role, "content": str(m.get("content", ""))[:1500]})
+    msgs.append({"role": "user", "content": message[:1500]})
+    payload = {"model": GROQ_MODEL, "messages": msgs, "max_tokens": 700, "temperature": 0.6}
+    try:
+        r = requests.post(GROQ_URL, json=payload, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=60)
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"(Assistant error: {e})"
+
+@app.post("/biz_chat")
+def biz_chat(inp: BizChatIn):
+    biz = get_biz(inp.biz_id)
+    if not biz:
+        return {"reply": "This assistant is not set up yet."}
+    return {"reply": biz_reply(biz, inp.history, inp.message)}
+
+@app.post("/biz_set")
+def biz_set(inp: BizSetIn):
+    """Owner updates a business profile (products, prices, FAQs, greeting, colour)."""
+    if inp.key != ADMIN_KEY:
+        return {"ok": False, "error": "Wrong admin key."}
+    existing = get_biz(inp.biz_id)
+    if existing:
+        run("UPDATE biz SET name=?, info=?, greeting=?, color=? WHERE biz_id=?",
+            (inp.name or existing["name"], inp.info or existing["info"],
+             inp.greeting or existing["greeting"], inp.color or existing["color"], inp.biz_id))
+    else:
+        run("INSERT INTO biz(biz_id, name, info, greeting, color, owner, ts) VALUES(?,?,?,?,?,?,?)",
+            (inp.biz_id, inp.name or inp.biz_id, inp.info, inp.greeting or "Hi! How can I help you today?",
+             inp.color or "#1488CC", "", time.time()))
+    return {"ok": True, "biz_id": inp.biz_id}
+
+_WIDGET_JS = r"""(function(){
+  var BIZ=%%BIZ%%, NAME=%%NAME%%, GREET=%%GREETING%%, COLOR=%%COLOR%%, API=%%BACKEND%%;
+  var hist=[], open=false;
+  var btn=document.createElement('div');
+  btn.innerHTML='\u{1F4AC}';
+  btn.style.cssText='position:fixed;bottom:20px;right:20px;width:60px;height:60px;border-radius:50%;'
+    +'background:'+COLOR+';color:#fff;font-size:28px;display:flex;align-items:center;justify-content:center;'
+    +'cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.3);z-index:999999;';
+  var box=document.createElement('div');
+  box.style.cssText='position:fixed;bottom:90px;right:20px;width:340px;max-width:92vw;height:480px;max-height:75vh;'
+    +'background:#fff;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,.35);z-index:999999;display:none;'
+    +'flex-direction:column;overflow:hidden;font-family:system-ui,Arial,sans-serif;';
+  box.innerHTML='<div style="background:'+COLOR+';color:#fff;padding:14px;font-weight:bold">'+NAME
+    +'<div style="font-weight:normal;font-size:12px;opacity:.85">Online • powered by Aura</div></div>'
+    +'<div id="aura_msgs" style="flex:1;overflow-y:auto;padding:12px;background:#f4f6fb"></div>'
+    +'<div style="display:flex;padding:8px;border-top:1px solid #eee">'
+    +'<input id="aura_in" placeholder="Type a message..." style="flex:1;border:1px solid #ddd;border-radius:20px;padding:10px 14px;outline:none">'
+    +'<button id="aura_send" style="margin-left:6px;border:none;background:'+COLOR+';color:#fff;border-radius:20px;padding:0 16px;cursor:pointer">Send</button></div>';
+  document.body.appendChild(btn); document.body.appendChild(box);
+  var msgs=box.querySelector('#aura_msgs'), inp=box.querySelector('#aura_in'), snd=box.querySelector('#aura_send');
+  function bubble(text,me){var d=document.createElement('div');
+    d.style.cssText='margin:6px 0;display:flex;'+(me?'justify-content:flex-end':'justify-content:flex-start');
+    d.innerHTML='<span style="max-width:80%;padding:9px 13px;border-radius:14px;font-size:14px;line-height:1.4;'
+      +(me?('background:'+COLOR+';color:#fff'):'background:#fff;color:#222;border:1px solid #eee')+'">'
+      +text.replace(/</g,'&lt;').replace(/\n/g,'<br>')+'</span>';
+    msgs.appendChild(d); msgs.scrollTop=msgs.scrollHeight;}
+  function toggle(){open=!open;box.style.display=open?'flex':'none';
+    if(open&&hist.length===0){bubble(GREET,false);hist.push({role:'assistant',content:GREET});inp.focus();}}
+  btn.onclick=toggle;
+  function send(){var t=inp.value.trim();if(!t)return;inp.value='';bubble(t,true);hist.push({role:'user',content:t});
+    var wait=document.createElement('div');wait.id='aura_wait';wait.style.cssText='color:#888;font-size:12px;margin:6px';
+    wait.textContent='typing...';msgs.appendChild(wait);msgs.scrollTop=msgs.scrollHeight;
+    fetch(API+'/biz_chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({biz_id:BIZ,message:t,history:hist})})
+      .then(function(r){return r.json()}).then(function(d){wait.remove();
+        var rep=d.reply||'Sorry, please try again.';bubble(rep,false);hist.push({role:'assistant',content:rep});})
+      .catch(function(){wait.remove();bubble('Network error, please try again.',false);});}
+  snd.onclick=send; inp.addEventListener('keydown',function(e){if(e.key==='Enter')send();});
+})();"""
+
+@app.get("/widget.js")
+def widget_js(biz: str = "elitedata"):
+    b = get_biz(biz) or {"biz_id": biz, "name": "Assistant", "greeting": "Hi! How can I help?", "color": "#1488CC"}
+    js = (_WIDGET_JS
+          .replace("%%BIZ%%", json.dumps(b["biz_id"]))
+          .replace("%%NAME%%", json.dumps(b["name"]))
+          .replace("%%GREETING%%", json.dumps(b["greeting"]))
+          .replace("%%COLOR%%", json.dumps(b["color"]))
+          .replace("%%BACKEND%%", json.dumps(BACKEND_URL)))
+    return Response(content=js, media_type="application/javascript")
+
+@app.get("/demo/{biz_id}", response_class=HTMLResponse)
+def biz_demo(biz_id: str):
+    """Live preview: a sample storefront with the Aura widget, so the owner sees how it looks."""
+    b = get_biz(biz_id) or {"biz_id": biz_id, "name": "Your Business", "color": "#1488CC"}
+    c = b["color"]
+    return ("<!doctype html><html><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>{b['name']} — Live Preview</title>"
+            "<style>*{box-sizing:border-box}body{margin:0;font-family:system-ui,Arial;background:#eef2f8;color:#1a2233}"
+            ".note{background:#fff3cd;color:#664d03;text-align:center;padding:8px;font-size:13px}"
+            f".hero{{background:linear-gradient(135deg,{c},#2b5876);color:#fff;padding:46px 20px;text-align:center}}"
+            ".hero h1{margin:0 0 6px;font-size:30px}.hero p{margin:0;opacity:.9}"
+            ".wrap{max-width:880px;margin:24px auto;padding:0 16px}"
+            ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px}"
+            ".card{background:#fff;border-radius:14px;padding:18px;text-align:center;box-shadow:0 4px 14px rgba(0,0,0,.06)}"
+            ".card b{font-size:22px}.card span{color:#7a8aa0;font-size:13px}"
+            f".buy{{margin-top:10px;background:{c};color:#fff;border:none;border-radius:20px;padding:8px 16px;cursor:pointer}}"
+            "</style></head><body>"
+            "<div class=note>👀 LIVE PREVIEW — this is a sample storefront. Tap the chat bubble (bottom-right) to talk to your Aura assistant.</div>"
+            f"<div class=hero><h1>{b['name']}</h1><p>Affordable data bundles • MTN · Telecel · AirtelTigo</p></div>"
+            "<div class=wrap><h2>Popular bundles</h2><div class=grid>"
+            "<div class=card><b>1GB</b><br><span>MTN</span><br><button class=buy>Buy</button></div>"
+            "<div class=card><b>2GB</b><br><span>Telecel</span><br><button class=buy>Buy</button></div>"
+            "<div class=card><b>5GB</b><br><span>AirtelTigo</span><br><button class=buy>Buy</button></div>"
+            "<div class=card><b>10GB</b><br><span>MTN</span><br><button class=buy>Buy</button></div>"
+            "</div><p style='color:#7a8aa0;margin-top:24px'>This is just a demo layout. Your real site keeps its own design — "
+            "only the chat bubble gets added.</p></div>"
+            f"<script src='{BACKEND_URL}/widget.js?biz={biz_id}'></script>"
+            "</body></html>")
+
+@app.get("/biz/{biz_id}", response_class=HTMLResponse)
+def biz_page(biz_id: str):
+    b = get_biz(biz_id)
+    if not b:
+        return HTMLResponse("<h2>Not found</h2>", status_code=404)
+    return ("<!doctype html><html><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>{b['name']}</title>"
+            f"<style>body{{margin:0;background:{b['color']};font-family:system-ui,Arial}}"
+            "</style></head><body>"
+            f"<script src='{BACKEND_URL}/widget.js?biz={biz_id}'></script>"
+            "<script>window.addEventListener('load',function(){setTimeout(function(){"
+            "document.querySelector('div[style*=\"border-radius:50%\"]').click();},400)})</script>"
+            "</body></html>")
 
 # ── Admin data (protected) ────────────────────────────────────────────────────
 @app.get("/admin_data")
