@@ -556,9 +556,42 @@ def _hf_image(prompt):
             return None
     return None
 
+_SPACES = ("black-forest-labs/FLUX.1-schnell", "stabilityai/stable-diffusion-3.5-large-turbo")
+
+def _space_image(prompt):
+    """Keyless fallback: call a public Hugging Face demo Space (free, no token needed)."""
+    import base64
+    try:
+        from gradio_client import Client
+    except Exception:
+        return None
+    for space in _SPACES:
+        try:
+            client = Client(space, httpx_kwargs={"timeout": 120})
+            try:
+                res = client.predict(prompt=prompt[:1500], api_name="/infer")
+            except Exception:
+                res = client.predict(prompt[:1500], api_name="/infer")
+            # result is usually (image_path_or_dict, seed) or just a path
+            item = res[0] if isinstance(res, (list, tuple)) else res
+            path = item.get("path") or item.get("url") if isinstance(item, dict) else item
+            if not path:
+                continue
+            if isinstance(path, str) and path.startswith("http"):
+                b = requests.get(path, timeout=60).content
+            else:
+                with open(path, "rb") as fh:
+                    b = fh.read()
+            if b and len(b) > 2000:
+                return "data:image/png;base64," + base64.b64encode(b).decode()
+        except Exception:
+            continue
+    return None
+
 def make_image(prompt):
-    """Generate an image and return a data: URI, or None if no provider is configured/working."""
-    return _cf_image(prompt) or _hf_image(prompt)
+    """Generate an image and return a data: URI, or None if nothing works.
+    Order: Cloudflare (if keys) → Hugging Face token (if key) → keyless public demo."""
+    return _cf_image(prompt) or _hf_image(prompt) or _space_image(prompt)
 
 @app.post("/chat")
 def chat(inp: ChatIn, bg: BackgroundTasks):
