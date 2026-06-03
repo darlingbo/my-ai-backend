@@ -25,6 +25,11 @@ DATA_API_BASE  = os.environ.get("DATA_API_BASE", "").strip().rstrip("/")   # e.g
 DATA_API_KEY   = os.environ.get("DATA_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 STUCK_MINUTES  = int(os.environ.get("STUCK_MINUTES", "15"))   # paid but not delivered after this many minutes = alert
+# Image generation (Pollinations went paid). Set ONE of these free providers:
+HF_TOKEN       = os.environ.get("HF_TOKEN", "").strip()        # Hugging Face (easiest: 1 free token)
+HF_MODEL       = os.environ.get("HF_MODEL", "black-forest-labs/FLUX.1-schnell").strip()
+CF_ACCOUNT_ID  = os.environ.get("CF_ACCOUNT_ID", "").strip()   # Cloudflare Workers AI (alt)
+CF_API_TOKEN   = os.environ.get("CF_API_TOKEN", "").strip()
 GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 DB_PATH      = os.environ.get("DB_PATH", "memory.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
@@ -520,10 +525,40 @@ def image_prompt(msg):
                r'( of| showing| for| with)?\s*', '', p, flags=re.I)
     return (p.strip() or msg.strip())
 
-def make_image_url(prompt):
-    enc = urllib.parse.quote(prompt)
-    seed = int(time.time()) % 99999
-    return f"https://image.pollinations.ai/prompt/{enc}?width=768&height=768&nologo=true&seed={seed}"
+def _cf_image(prompt):
+    if not (CF_ACCOUNT_ID and CF_API_TOKEN):
+        return None
+    try:
+        r = requests.post(
+            f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell",
+            headers={"Authorization": f"Bearer {CF_API_TOKEN}"}, json={"prompt": prompt[:2000]}, timeout=60)
+        b64 = (r.json().get("result", {}) or {}).get("image")
+        return "data:image/jpeg;base64," + b64 if b64 else None
+    except Exception:
+        return None
+
+def _hf_image(prompt):
+    if not HF_TOKEN:
+        return None
+    import base64
+    for _ in range(3):
+        try:
+            r = requests.post(f"https://api-inference.huggingface.co/models/{HF_MODEL}",
+                              headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                              json={"inputs": prompt[:2000]}, timeout=120)
+            ctype = r.headers.get("content-type", "")
+            if r.status_code == 200 and ctype.startswith("image"):
+                return "data:image/png;base64," + base64.b64encode(r.content).decode()
+            if r.status_code == 503:   # model warming up
+                time.sleep(8); continue
+            return None
+        except Exception:
+            return None
+    return None
+
+def make_image(prompt):
+    """Generate an image and return a data: URI, or None if no provider is configured/working."""
+    return _cf_image(prompt) or _hf_image(prompt)
 
 @app.post("/chat")
 def chat(inp: ChatIn, bg: BackgroundTasks):
@@ -536,11 +571,16 @@ def chat(inp: ChatIn, bg: BackgroundTasks):
     # Image request → actually generate one (works on every surface: web, app, chat)
     if wants_image(inp.message):
         prompt = image_prompt(inp.message)
-        url = make_image_url(prompt)
-        reply = f"Here's the image I created for: \"{prompt}\" 🎨\nTell me any change and I'll make a new version."
+        data = make_image(prompt)
         save_message(inp.user_id, "user", inp.message, inp.conv_id)
-        save_message(inp.user_id, "assistant", reply + " " + url, inp.conv_id)
-        return {"reply": reply, "image_url": url}
+        if data:
+            reply = f"Here's the image I created for: \"{prompt}\" 🎨\nTell me any change and I'll make a new version."
+            save_message(inp.user_id, "assistant", reply, inp.conv_id)
+            return {"reply": reply, "image_url": data}
+        reply = ("I can make images, but the image generator isn't connected yet on the server. "
+                 "(Owner: add a free HF_TOKEN — takes 1 minute — and image creation turns on instantly.)")
+        save_message(inp.user_id, "assistant", reply, inp.conv_id)
+        return {"reply": reply}
     save_message(inp.user_id, "user", inp.message, inp.conv_id)
     history = get_history(inp.user_id, inp.conv_id)
     facts = get_facts(inp.user_id)
@@ -604,10 +644,11 @@ def build(inp: BuildIn):
 
 @app.post("/image")
 def image(inp: ImageIn):
-    enc = urllib.parse.quote(inp.prompt)
-    seed = int(time.time()) % 99999
-    url = f"https://image.pollinations.ai/prompt/{enc}?width={inp.width}&height={inp.height}&nologo=true&seed={seed}"
-    return {"url": url, "prompt": inp.prompt}
+    data = make_image(inp.prompt)
+    if data:
+        return {"url": data, "prompt": inp.prompt}
+    return {"url": "", "prompt": inp.prompt,
+            "error": "Image generator not connected. Owner: add a free HF_TOKEN on the server."}
 
 @app.get("/search")
 def search(q: str, n: int = 5):
