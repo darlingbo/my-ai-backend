@@ -503,6 +503,28 @@ async def paystack_webhook(request: Request):
         pass
     return {"ok": True}
 
+IMG_TRIGGERS = ("draw", "sketch", "paint", "doodle", "illustrate", "generate an image", "generate a image",
+                "generate image", "create an image", "create a image", "make an image", "make me an image",
+                "make a image", "image of", "picture of", "a logo", "design a logo", "make a logo", "create a logo",
+                "logo for", "poster", "banner", "flyer", "wallpaper", "an illustration", "draw me")
+
+def wants_image(msg):
+    ml = msg.lower()
+    return any(k in ml for k in IMG_TRIGGERS)
+
+def image_prompt(msg):
+    p = msg.strip()
+    p = re.sub(r'^(can you|could you|pls|please|hey|aura|yo)[, ]+', '', p, flags=re.I)
+    p = re.sub(r'^(draw|sketch|paint|doodle|illustrate|design|generate|create|make|give me|show me|i want|i need)'
+               r'( me)?( a| an| the)?\s*(image|picture|photo|logo|poster|banner|flyer|wallpaper|drawing|illustration|art)?'
+               r'( of| showing| for| with)?\s*', '', p, flags=re.I)
+    return (p.strip() or msg.strip())
+
+def make_image_url(prompt):
+    enc = urllib.parse.quote(prompt)
+    seed = int(time.time()) % 99999
+    return f"https://image.pollinations.ai/prompt/{enc}?width=768&height=768&nologo=true&seed={seed}"
+
 @app.post("/chat")
 def chat(inp: ChatIn, bg: BackgroundTasks):
     # Business AI: 7-day free trial, then must subscribe
@@ -511,6 +533,14 @@ def chat(inp: ChatIn, bg: BackgroundTasks):
         if not allowed:
             return {"reply": "🔒 Your 7-day free Business trial has ended.\n\nSubscribe to keep using Business AI — unlock invoices, marketing, customer replies, pricing and growth tools without limits.",
                     "locked": True}
+    # Image request → actually generate one (works on every surface: web, app, chat)
+    if wants_image(inp.message):
+        prompt = image_prompt(inp.message)
+        url = make_image_url(prompt)
+        reply = f"Here's the image I created for: \"{prompt}\" 🎨\nTell me any change and I'll make a new version."
+        save_message(inp.user_id, "user", inp.message, inp.conv_id)
+        save_message(inp.user_id, "assistant", reply + " " + url, inp.conv_id)
+        return {"reply": reply, "image_url": url}
     save_message(inp.user_id, "user", inp.message, inp.conv_id)
     history = get_history(inp.user_id, inp.conv_id)
     facts = get_facts(inp.user_id)
@@ -1186,7 +1216,11 @@ async function send(){
  const t=document.getElementById('in').value.trim();if(!t)return;document.getElementById('in').value='';add('u',t);
  const th=add('a','…');
  try{const r=await fetch(API+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid,message:t,mode:mode})});
- const d=await r.json();th.textContent=d.reply;say(d.reply);}catch(e){th.textContent='Connection error.';}
+ const d=await r.json();th.textContent=d.reply;say(d.reply);
+ if(d.image_url){const m=document.getElementById('msgs');const a=document.createElement('a');a.href=d.image_url;a.target='_blank';
+  const im=document.createElement('img');im.src=d.image_url;im.style.cssText='max-width:80%;border-radius:14px;align-self:flex-start;margin-top:2px';
+  a.appendChild(im);m.appendChild(a);m.scrollTop=m.scrollHeight;}
+ }catch(e){th.textContent='Connection error.';}
 }
 // ---- Voice output (text to speech), strips emojis/markdown so it reads naturally ----
 function clean(t){return (t||'').replace(/[*_#`>~]/g,'').replace(/\\[(.*?)\\]\\(.*?\\)/g,'$1')
