@@ -1132,40 +1132,45 @@ async function load(){
 @app.get("/web", response_class=HTMLResponse)
 def web_app():
     return """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>My AI</title><style>
+<title>Aura</title><style>
 *{box-sizing:border-box}body{font-family:system-ui,Arial;background:#0b0f1a;color:#e6eeff;margin:0;height:100vh;display:flex;flex-direction:column}
 #top{padding:12px 16px;border-bottom:1px solid #1e2a4a;display:flex;align-items:center;gap:10px}
-#top b{color:#3be0ff;font-size:1.2rem}select{margin-left:auto;background:#0f1730;color:#e6eeff;border:1px solid #2a3a66;border-radius:8px;padding:6px}
+#top b{color:#3be0ff;font-size:1.2rem}
+.icbtn{background:#0f1730;border:1px solid #2a3a66;color:#3be0ff;border-radius:10px;padding:7px 10px;cursor:pointer;font-size:16px}
+.icbtn.on{background:#3be0ff;color:#06121f}
+select{background:#0f1730;color:#e6eeff;border:1px solid #2a3a66;border-radius:8px;padding:6px}
 #msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
 .b{max-width:80%;padding:10px 14px;border-radius:14px;line-height:1.5;white-space:pre-wrap}
 .u{align-self:flex-end;background:linear-gradient(135deg,#3be0ff,#6b8cff);color:#06121f;border-bottom-right-radius:4px}
 .a{align-self:flex-start;background:#172241;border:1px solid #2a3a66;border-bottom-left-radius:4px}
 #bar{display:flex;gap:8px;padding:12px;border-top:1px solid #1e2a4a}
 #in{flex:1;padding:12px;border-radius:12px;border:1px solid #2a3a66;background:#0f1730;color:#e6eeff;font-size:15px}
-#send{padding:12px 18px;border:none;border-radius:12px;background:linear-gradient(135deg,#3be0ff,#6b8cff);color:#06121f;font-weight:700;cursor:pointer}
-.auth{max-width:360px;margin:8vh auto;padding:20px}.auth input{width:100%;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #2a3a66;background:#0f1730;color:#e6eeff}
+#send,#mic{padding:12px 16px;border:none;border-radius:12px;background:linear-gradient(135deg,#3be0ff,#6b8cff);color:#06121f;font-weight:700;cursor:pointer}
+#mic{background:#172241;color:#3be0ff;border:1px solid #2a3a66}#mic.rec{background:#ff5c7a;color:#fff}
+.auth{max-width:360px;margin:8vh auto;padding:20px;text-align:center}.auth input{width:100%;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #2a3a66;background:#0f1730;color:#e6eeff}
 .auth button{width:100%;padding:13px;border:none;border-radius:10px;background:linear-gradient(135deg,#3be0ff,#6b8cff);color:#06121f;font-weight:700;font-size:16px;cursor:pointer}
 a{color:#3be0ff;cursor:pointer}
 </style></head><body>
 <div id=app></div>
 <script>
-const API='';let uid=localStorage.getItem('uid'),uname=localStorage.getItem('uname'),mode='general',signup=true;
-function esc(s){return (s||'').replace(/</g,'&lt;')}
+const API='';let uid=localStorage.getItem('uid'),uname=localStorage.getItem('uname'),mode='general',signup=true,speak=false;
 function render(){
  if(!uid){document.getElementById('app').innerHTML=
-  `<div class=auth><h1 style=color:#3be0ff>🤖 My AI</h1>
+  `<div class=auth><h1 style=color:#3be0ff>🤖 Aura</h1><p style=color:#7c8ab0;margin-top:-8px>Your own AI assistant</p>
    <div id=nameRow><input id=nm placeholder="Your name"></div>
    <input id=em placeholder="Email"><input id=pw type=password placeholder="Password">
    <button onclick=auth()>${signup?'Sign Up':'Log In'}</button>
    <p><a onclick=tog()>${signup?'Have an account? Log in':'New? Create account'}</a></p></div>`;
   document.getElementById('nameRow').style.display=signup?'block':'none';return;}
  document.getElementById('app').innerHTML=
-  `<div id=top><b>🤖 My AI</b>
-    <select id=mode onchange="mode=this.value">
+  `<div id=top><b>🤖 Aura</b>
+    <button id=spk class=icbtn onclick=toggleSpeak() title="Read replies aloud">🔇</button>
+    <select id=mode onchange="mode=this.value" style=margin-left:auto>
      <option value=general>💬 Daily</option><option value=student>🎓 Student</option><option value=business>💼 Business</option>
     </select></div>
    <div id=msgs></div>
-   <div id=bar><input id=in placeholder="Message…" onkeydown="if(event.key==='Enter')send()"><button id=send onclick=send()>➤</button></div>`;
+   <div id=bar><input id=in placeholder="Message, or tap 🎤 to talk…" onkeydown="if(event.key==='Enter')send()">
+    <button id=mic onclick=startVoice() title="Speak">🎤</button><button id=send onclick=send()>➤</button></div>`;
  add('a','Hi '+(uname||'')+'! I remember our past chats. How can I help?');loadHist();
 }
 function tog(){signup=!signup;render()}
@@ -1181,7 +1186,18 @@ async function send(){
  const t=document.getElementById('in').value.trim();if(!t)return;document.getElementById('in').value='';add('u',t);
  const th=add('a','…');
  try{const r=await fetch(API+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid,message:t,mode:mode})});
- const d=await r.json();th.textContent=d.reply;}catch(e){th.textContent='Connection error.';}
+ const d=await r.json();th.textContent=d.reply;say(d.reply);}catch(e){th.textContent='Connection error.';}
 }
+// ---- Voice output (text to speech), strips emojis/markdown so it reads naturally ----
+function clean(t){return (t||'').replace(/[*_#`>~]/g,'').replace(/\\[(.*?)\\]\\(.*?\\)/g,'$1')
+ .replace(/[\\u{1F000}-\\u{1FFFF}\\u{2600}-\\u{27BF}\\u{2190}-\\u{21FF}\\u{2B00}-\\u{2BFF}]/gu,'').trim()}
+function toggleSpeak(){speak=!speak;const b=document.getElementById('spk');b.textContent=speak?'🔊':'🔇';b.classList.toggle('on',speak);
+ if(!speak&&window.speechSynthesis)speechSynthesis.cancel()}
+function say(t){if(!speak||!window.speechSynthesis)return;const u=new SpeechSynthesisUtterance(clean(t));u.rate=1;speechSynthesis.cancel();speechSynthesis.speak(u)}
+// ---- Voice input (speech to text) ----
+function startVoice(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){alert('Voice not supported on this browser. Try Chrome.');return;}
+ const rec=new SR();rec.lang='en-GH';const mic=document.getElementById('mic');mic.classList.add('rec');
+ rec.onresult=e=>{document.getElementById('in').value=e.results[0][0].transcript;send();};
+ rec.onend=()=>mic.classList.remove('rec');rec.onerror=()=>mic.classList.remove('rec');rec.start();}
 render();
 </script></body></html>"""
