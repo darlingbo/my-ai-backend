@@ -60,6 +60,10 @@ def init_db():
     run("CREATE TABLE IF NOT EXISTS access(user_id TEXT, biz_trial_start DOUBLE PRECISION, premium INTEGER, premium_until DOUBLE PRECISION)")
     # businesses that embed Aura on their own website (e.g. Elite Data)
     run("CREATE TABLE IF NOT EXISTS biz(biz_id TEXT PRIMARY KEY, name TEXT, info TEXT, greeting TEXT, color TEXT, owner TEXT, ts DOUBLE PRECISION)")
+    # customer orders captured by the business assistant
+    run("CREATE TABLE IF NOT EXISTS orders(order_id TEXT, biz_id TEXT, network TEXT, bundle TEXT, phone TEXT, amount TEXT, note TEXT, status TEXT, ts DOUBLE PRECISION)")
+    # transcript of customer <-> assistant chats per business
+    run("CREATE TABLE IF NOT EXISTS biz_msgs(biz_id TEXT, session TEXT, role TEXT, content TEXT, ts DOUBLE PRECISION)")
     # multiple conversations per user (ChatGPT-style)
     try: run("ALTER TABLE messages ADD COLUMN conv_id TEXT")
     except Exception: pass
@@ -269,7 +273,9 @@ class BuildIn(BaseModel):
     prompt: str
 
 class BizChatIn(BaseModel):
-    biz_id: str; message: str; history: list = []
+    biz_id: str; message: str; history: list = []; session: str = ""
+class BizPayIn(BaseModel):
+    biz_id: str; amount: str = ""; phone: str = ""; order_id: str = ""
 class BizSetIn(BaseModel):
     key: str = ""; biz_id: str; name: str = ""; info: str = ""; greeting: str = ""; color: str = ""
 
@@ -589,8 +595,15 @@ def biz_reply(biz, history, message):
         "You talk to CUSTOMERS on the business's website. Be warm, short, and helpful, like a good shop attendant. "
         "Use ONLY the business information below to answer about products, prices, and how to order. "
         "If a price or detail is NOT in the information, do NOT make it up — say you'll confirm it and ask for the "
-        "details you need to take their order. Help the customer step by step and guide them to place an order. "
-        "Keep replies natural and friendly (this is Ghana — Mobile Money, MTN/Telecel/AirtelTigo are normal). "
+        "details you need to take their order. Help the customer step by step and guide them to place an order.\n"
+        "LANGUAGE: Reply in the SAME language the customer uses. If they write in Twi, Ga, Ewe, or Pidgin English, "
+        "reply naturally in that language. This is Ghana — Mobile Money (MoMo), MTN/Telecel/AirtelTigo are normal.\n"
+        "TAKING AN ORDER: When the customer has given you the NETWORK, the BUNDLE/size, and the PHONE NUMBER to load, "
+        "AND they confirm they want it, you MUST record the order. To record it, put this EXACT line at the very END "
+        "of your reply (on its own line), filling the values:\n"
+        "[[ORDER network=MTN; bundle=5GB; phone=0241234567; amount=25]]\n"
+        "Use amount only if you know the price; otherwise write amount=?. Write the [[ORDER ...]] line ONLY when all "
+        "details are gathered and confirmed — never before. The customer never sees this line; just speak normally above it.\n"
         "Never discuss anything unrelated to this business.\n\n"
         f"=== BUSINESS INFORMATION ===\n{biz['info']}\n=== END ==="
     )
@@ -606,12 +619,101 @@ def biz_reply(biz, history, message):
     except Exception as e:
         return f"(Assistant error: {e})"
 
+def parse_order(biz_id, text):
+    """Pull an [[ORDER ...]] line out of the reply, save it, and return (clean_text, order)."""
+    m = re.search(r"\[\[ORDER(.*?)\]\]", text, re.DOTALL)
+    if not m:
+        return text, None
+    fields = {}
+    for part in m.group(1).split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            fields[k.strip().lower()] = v.strip()
+    clean = (text[:m.start()] + text[m.end():]).strip()
+    oid = "o_" + uuid.uuid4().hex[:10]
+    amount = fields.get("amount", "?")
+    run("INSERT INTO orders(order_id, biz_id, network, bundle, phone, amount, note, status, ts) VALUES(?,?,?,?,?,?,?,?,?)",
+        (oid, biz_id, fields.get("network", ""), fields.get("bundle", ""), fields.get("phone", ""),
+         amount, "", "new", time.time()))
+    return clean, {"order_id": oid, "amount": amount, "phone": fields.get("phone", "")}
+
 @app.post("/biz_chat")
 def biz_chat(inp: BizChatIn):
     biz = get_biz(inp.biz_id)
     if not biz:
         return {"reply": "This assistant is not set up yet."}
-    return {"reply": biz_reply(biz, inp.history, inp.message)}
+    reply = biz_reply(biz, inp.history, inp.message)
+    reply, order = parse_order(inp.biz_id, reply)
+    # log transcript
+    sess = inp.session or "anon"
+    run("INSERT INTO biz_msgs(biz_id, session, role, content, ts) VALUES(?,?,?,?,?)",
+        (inp.biz_id, sess, "user", inp.message[:2000], time.time()))
+    run("INSERT INTO biz_msgs(biz_id, session, role, content, ts) VALUES(?,?,?,?,?)",
+        (inp.biz_id, sess, "assistant", reply[:2000], time.time()))
+    out = {"reply": reply}
+    # if an order was captured with a known amount and Paystack is set up, offer in-chat payment
+    if order:
+        out["order_id"] = order["order_id"]
+        amt = (order["amount"] or "").replace("GH₵", "").replace("GHS", "").strip()
+        if PAYSTACK_SECRET and amt.replace(".", "").isdigit() and float(amt) > 0:
+            pr = _paystack_init(amt, f"{order['phone'] or order['order_id']}@{inp.biz_id}.pay",
+                                 {"biz_id": inp.biz_id, "order_id": order["order_id"]})
+            if pr.get("ok"):
+                out["pay_url"] = pr["url"]
+                out["pay_amount"] = amt
+    return out
+
+def _paystack_init(amount_cedis, email, metadata):
+    try:
+        kobo = int(round(float(amount_cedis) * 100))
+        r = requests.post("https://api.paystack.co/transaction/initialize",
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET}", "Content-Type": "application/json"},
+            json={"email": email, "amount": kobo, "currency": PAY_CURRENCY, "metadata": metadata}, timeout=30)
+        d = r.json()
+        if d.get("status"):
+            return {"ok": True, "url": d["data"]["authorization_url"], "reference": d["data"]["reference"]}
+        return {"ok": False, "error": d.get("message", "init failed")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/biz_pay")
+def biz_pay(inp: BizPayIn):
+    if not PAYSTACK_SECRET:
+        return {"ok": False, "error": "Payments not set up. Owner must add PAYSTACK_SECRET_KEY."}
+    amt = (inp.amount or "").replace("GH₵", "").replace("GHS", "").strip()
+    if not amt.replace(".", "").isdigit():
+        return {"ok": False, "error": "Invalid amount."}
+    return _paystack_init(amt, f"{inp.phone or inp.order_id}@{inp.biz_id}.pay",
+                          {"biz_id": inp.biz_id, "order_id": inp.order_id})
+
+@app.get("/shop/{biz_id}", response_class=HTMLResponse)
+def shop_dashboard(biz_id: str, key: str = ""):
+    b = get_biz(biz_id)
+    if not b:
+        return HTMLResponse("<h2>Business not found</h2>", status_code=404)
+    if key != ADMIN_KEY:
+        return HTMLResponse("<body style='font-family:system-ui;background:#0b0f1a;color:#e6eeff;text-align:center;padding:60px'>"
+                            "<h2>🔒 Private</h2><p>Add your owner key to the link: <code>?key=YOUR_KEY</code></p></body>")
+    orows = run("SELECT order_id, network, bundle, phone, amount, status, ts FROM orders WHERE biz_id=? ORDER BY ts DESC LIMIT 200",
+                (biz_id,), "all") or []
+    import datetime as _dt
+    order_rows = "".join(
+        f"<tr><td>{_dt.datetime.fromtimestamp(o[6]).strftime('%d %b %H:%M')}</td><td>{o[1]}</td><td>{o[2]}</td>"
+        f"<td>{o[3]}</td><td>{o[4]}</td><td>{o[5]}</td></tr>" for o in orows)
+    if not order_rows:
+        order_rows = "<tr><td colspan=6 style='color:#7a8aa0'>No orders yet.</td></tr>"
+    return ("<!doctype html><html><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>{b['name']} — Orders</title>"
+            "<style>body{font-family:system-ui,Arial;background:#0b0f1a;color:#e6eeff;margin:0;padding:18px}"
+            "h1{color:#3BE0FF}table{width:100%;border-collapse:collapse;margin-top:12px;background:#0f1730;border-radius:10px;overflow:hidden}"
+            "th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #1c2740;font-size:14px}th{color:#7a8aa0}"
+            "</style></head><body>"
+            f"<h1>📦 {b['name']} — Orders ({len(orows)})</h1>"
+            "<table><tr><th>When</th><th>Network</th><th>Bundle</th><th>Phone</th><th>Amount</th><th>Status</th></tr>"
+            + order_rows + "</table>"
+            "<p style='color:#7a8aa0;margin-top:20px;font-size:13px'>Refresh to see new orders. Customers' orders appear here automatically.</p>"
+            "</body></html>")
 
 @app.post("/biz_set")
 def biz_set(inp: BizSetIn):
@@ -631,7 +733,8 @@ def biz_set(inp: BizSetIn):
 
 _WIDGET_JS = r"""(function(){
   var BIZ=%%BIZ%%, NAME=%%NAME%%, GREET=%%GREETING%%, COLOR=%%COLOR%%, API=%%BACKEND%%;
-  var hist=[], open=false;
+  var hist=[], open=false, speak=false;
+  var SESS='web_'+Math.random().toString(36).slice(2)+Date.now();
   var btn=document.createElement('div');
   btn.innerHTML='\u{1F4AC}';
   btn.style.cssText='position:fixed;bottom:20px;right:20px;width:60px;height:60px;border-radius:50%;'
@@ -641,32 +744,50 @@ _WIDGET_JS = r"""(function(){
   box.style.cssText='position:fixed;bottom:90px;right:20px;width:340px;max-width:92vw;height:480px;max-height:75vh;'
     +'background:#fff;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,.35);z-index:999999;display:none;'
     +'flex-direction:column;overflow:hidden;font-family:system-ui,Arial,sans-serif;';
-  box.innerHTML='<div style="background:'+COLOR+';color:#fff;padding:14px;font-weight:bold">'+NAME
-    +'<div style="font-weight:normal;font-size:12px;opacity:.85">Online • powered by Aura</div></div>'
+  box.innerHTML='<div style="background:'+COLOR+';color:#fff;padding:14px;font-weight:bold;display:flex;align-items:center">'
+    +'<div style="flex:1">'+NAME+'<div style="font-weight:normal;font-size:12px;opacity:.85">Online • powered by Aura</div></div>'
+    +'<span id="aura_spk" title="Read replies aloud" style="cursor:pointer;font-size:20px;opacity:.6">\u{1F507}</span></div>'
     +'<div id="aura_msgs" style="flex:1;overflow-y:auto;padding:12px;background:#f4f6fb"></div>'
-    +'<div style="display:flex;padding:8px;border-top:1px solid #eee">'
+    +'<div style="display:flex;padding:8px;border-top:1px solid #eee;align-items:center">'
     +'<input id="aura_in" placeholder="Type a message..." style="flex:1;border:1px solid #ddd;border-radius:20px;padding:10px 14px;outline:none">'
-    +'<button id="aura_send" style="margin-left:6px;border:none;background:'+COLOR+';color:#fff;border-radius:20px;padding:0 16px;cursor:pointer">Send</button></div>';
+    +'<button id="aura_mic" title="Speak" style="margin-left:6px;border:none;background:#eef;border-radius:50%;width:40px;height:40px;cursor:pointer;font-size:18px">\u{1F3A4}</button>'
+    +'<button id="aura_send" style="margin-left:6px;border:none;background:'+COLOR+';color:#fff;border-radius:20px;padding:0 16px;height:40px;cursor:pointer">Send</button></div>';
   document.body.appendChild(btn); document.body.appendChild(box);
   var msgs=box.querySelector('#aura_msgs'), inp=box.querySelector('#aura_in'), snd=box.querySelector('#aura_send');
+  var mic=box.querySelector('#aura_mic'), spk=box.querySelector('#aura_spk');
   function bubble(text,me){var d=document.createElement('div');
     d.style.cssText='margin:6px 0;display:flex;'+(me?'justify-content:flex-end':'justify-content:flex-start');
     d.innerHTML='<span style="max-width:80%;padding:9px 13px;border-radius:14px;font-size:14px;line-height:1.4;'
       +(me?('background:'+COLOR+';color:#fff'):'background:#fff;color:#222;border:1px solid #eee')+'">'
       +text.replace(/</g,'&lt;').replace(/\n/g,'<br>')+'</span>';
     msgs.appendChild(d); msgs.scrollTop=msgs.scrollHeight;}
+  function payButton(url,amt){var d=document.createElement('div');d.style.cssText='margin:6px 0;text-align:center';
+    d.innerHTML='<a href="'+url+'" target="_blank" style="display:inline-block;background:#16a34a;color:#fff;'
+      +'text-decoration:none;border-radius:20px;padding:10px 20px;font-weight:bold">\u{1F4B3} Pay GH₵'+amt+' now</a>';
+    msgs.appendChild(d); msgs.scrollTop=msgs.scrollHeight;}
+  function say(t){if(!speak||!window.speechSynthesis)return;var u=new SpeechSynthesisUtterance(t);
+    speechSynthesis.cancel();speechSynthesis.speak(u);}
   function toggle(){open=!open;box.style.display=open?'flex':'none';
     if(open&&hist.length===0){bubble(GREET,false);hist.push({role:'assistant',content:GREET});inp.focus();}}
   btn.onclick=toggle;
+  spk.onclick=function(){speak=!speak;spk.textContent=speak?'\u{1F50A}':'\u{1F507}';spk.style.opacity=speak?'1':'.6';
+    if(!speak&&window.speechSynthesis)speechSynthesis.cancel();};
   function send(){var t=inp.value.trim();if(!t)return;inp.value='';bubble(t,true);hist.push({role:'user',content:t});
     var wait=document.createElement('div');wait.id='aura_wait';wait.style.cssText='color:#888;font-size:12px;margin:6px';
     wait.textContent='typing...';msgs.appendChild(wait);msgs.scrollTop=msgs.scrollHeight;
     fetch(API+'/biz_chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({biz_id:BIZ,message:t,history:hist})})
+      body:JSON.stringify({biz_id:BIZ,message:t,history:hist,session:SESS})})
       .then(function(r){return r.json()}).then(function(d){wait.remove();
-        var rep=d.reply||'Sorry, please try again.';bubble(rep,false);hist.push({role:'assistant',content:rep});})
+        var rep=d.reply||'Sorry, please try again.';bubble(rep,false);hist.push({role:'assistant',content:rep});say(rep);
+        if(d.pay_url)payButton(d.pay_url,d.pay_amount||'');})
       .catch(function(){wait.remove();bubble('Network error, please try again.',false);});}
   snd.onclick=send; inp.addEventListener('keydown',function(e){if(e.key==='Enter')send();});
+  // voice input
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(SR){var rec=new SR();rec.lang='en-GH';rec.onresult=function(e){inp.value=e.results[0][0].transcript;send();};
+    mic.onclick=function(){try{rec.start();mic.style.background='#fdd';
+      rec.onend=function(){mic.style.background='#eef';};}catch(err){}};}
+  else{mic.style.display='none';}
 })();"""
 
 @app.get("/widget.js")
