@@ -4,7 +4,7 @@ Architecture:  User → App → THIS SERVER → AI Model + Memory + Tools
 
 Uses PostgreSQL (permanent) when DATABASE_URL is set, else SQLite (local dev).
 """
-import os, sqlite3, time, json, urllib.parse, hashlib, uuid, re
+import os, sqlite3, time, json, urllib.parse, hashlib, hmac, uuid, re
 from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
@@ -20,6 +20,11 @@ PAY_DAYS     = int(os.environ.get("PAY_DAYS", "30"))       # premium length per 
 # ── Config ───────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+# Operations auditor (Elite Data): data provider + Telegram alerts
+DATA_API_BASE  = os.environ.get("DATA_API_BASE", "").strip().rstrip("/")   # e.g. https://provider.com
+DATA_API_KEY   = os.environ.get("DATA_API_KEY", "").strip()
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+STUCK_MINUTES  = int(os.environ.get("STUCK_MINUTES", "15"))   # paid but not delivered after this many minutes = alert
 GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 DB_PATH      = os.environ.get("DB_PATH", "memory.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
@@ -64,6 +69,12 @@ def init_db():
     run("CREATE TABLE IF NOT EXISTS orders(order_id TEXT, biz_id TEXT, network TEXT, bundle TEXT, phone TEXT, amount TEXT, note TEXT, status TEXT, ts DOUBLE PRECISION)")
     # transcript of customer <-> assistant chats per business
     run("CREATE TABLE IF NOT EXISTS biz_msgs(biz_id TEXT, session TEXT, role TEXT, content TEXT, ts DOUBLE PRECISION)")
+    # operations auditor: one row per transaction, tracks payment + delivery
+    run("CREATE TABLE IF NOT EXISTS recon(ref TEXT, biz_id TEXT, phone TEXT, network TEXT, amount TEXT, "
+        "paid INTEGER DEFAULT 0, paid_at DOUBLE PRECISION, delivery TEXT DEFAULT 'none', delivered_at DOUBLE PRECISION, "
+        "alerted INTEGER DEFAULT 0, created DOUBLE PRECISION)")
+    # simple key/value settings (e.g. Telegram chat id per business)
+    run("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)")
     # multiple conversations per user (ChatGPT-style)
     try: run("ALTER TABLE messages ADD COLUMN conv_id TEXT")
     except Exception: pass
@@ -281,7 +292,8 @@ class BizSetIn(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/status")
-def status():
+def status(bg: BackgroundTasks):
+    bg.add_task(run_sweep)   # keep-alive ping also drives the operations auditor
     return {"status": "online", "service": "My AI Backend", "model": GROQ_MODEL,
             "key_set": bool(GROQ_API_KEY), "database": "postgres (permanent)" if USE_PG else "sqlite (local)"}
 
@@ -845,6 +857,194 @@ def biz_page(biz_id: str):
             "<script>window.addEventListener('load',function(){setTimeout(function(){"
             "document.querySelector('div[style*=\"border-radius:50%\"]').click();},400)})</script>"
             "</body></html>")
+
+# ── Operations Auditor: watch payment ↔ delivery, alert on mismatch ────────────
+def _set(k, v):
+    if run("SELECT 1 FROM settings WHERE k=?", (k,), "one"):
+        run("UPDATE settings SET v=? WHERE k=?", (str(v), k))
+    else:
+        run("INSERT INTO settings(k, v) VALUES(?,?)", (k, str(v)))
+
+def _get(k, default=""):
+    row = run("SELECT v FROM settings WHERE k=?", (k,), "one")
+    return row[0] if row else default
+
+def tg_send(text):
+    chat = _get("tg_chat")
+    if not TELEGRAM_TOKEN or not chat:
+        return False
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id": chat, "text": text}, timeout=20)
+        return True
+    except Exception:
+        return False
+
+def _recon_row(ref):
+    return run("SELECT ref,biz_id,phone,network,amount,paid,paid_at,delivery,delivered_at,alerted,created FROM recon WHERE ref=?",
+               (ref,), "one")
+
+def _recon_upsert(ref, biz_id, **f):
+    if not _recon_row(ref):
+        run("INSERT INTO recon(ref, biz_id, created) VALUES(?,?,?)", (ref, biz_id, time.time()))
+    for k, v in f.items():
+        if v is not None:
+            run(f"UPDATE recon SET {k}=? WHERE ref=?", (v, ref))
+
+def poll_delivery(ref):
+    """Ask the data provider directly whether an order completed."""
+    if not (DATA_API_BASE and DATA_API_KEY):
+        return None
+    try:
+        r = requests.get(f"{DATA_API_BASE}/api/developer/orders/{ref}",
+                         headers={"Authorization": f"Bearer {DATA_API_KEY}"}, timeout=30)
+        return (r.json().get("data", {}) or {}).get("status")
+    except Exception:
+        return None
+
+def reconcile(ref):
+    """Decide if this transaction is healthy or needs an alert."""
+    row = _recon_row(ref)
+    if not row or row[9]:   # missing or already alerted
+        return
+    _, biz, phone, network, amount, paid, _pa, delivery, _da, _al, _cr = row
+    if paid and delivery == "failed":
+        tg_send(f"🚨 PAID but DELIVERY FAILED\nNetwork: {network}\nPhone: {phone}\nAmount: GH₵{amount}\nRef: {ref}\n→ Refund or resend the bundle.")
+        run("UPDATE recon SET alerted=1 WHERE ref=?", (ref,))
+    elif paid and delivery == "completed":
+        run("UPDATE recon SET alerted=1 WHERE ref=?", (ref,))   # healthy, close it silently
+
+@app.post("/hook/paystack")
+async def hook_paystack(request: Request, biz: str = "elitedata"):
+    raw = await request.body()
+    sig = request.headers.get("x-paystack-signature", "")
+    if PAYSTACK_SECRET and sig:
+        expected = hmac.new(PAYSTACK_SECRET.encode(), raw, hashlib.sha512).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            return {"ok": False, "error": "bad signature"}
+    try:
+        body = json.loads(raw)
+    except Exception:
+        return {"ok": False}
+    if body.get("event") == "charge.success":
+        d = body.get("data", {})
+        ref = d.get("reference")
+        amount = (d.get("amount", 0) or 0) / 100.0
+        meta = d.get("metadata") or {}
+        phone = meta.get("phone") or meta.get("Phone") or ""
+        if ref:
+            _recon_upsert(ref, biz, paid=1, paid_at=time.time(), amount=str(amount), phone=phone or None)
+            reconcile(ref)
+    return {"ok": True}
+
+@app.post("/hook/delivery")
+async def hook_delivery(request: Request, biz: str = "elitedata"):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False}
+    d = body.get("data", {})
+    ref = d.get("reference")
+    if not ref:
+        return {"ok": False}
+    dmap = {"order.completed": "completed", "order.failed": "failed", "order.processing": "processing"}
+    delivery = dmap.get(body.get("event"), (d.get("status", "") or "").lower())
+    _recon_upsert(ref, biz, delivery=delivery,
+                  delivered_at=(time.time() if delivery == "completed" else None),
+                  phone=d.get("phone"), amount=(str(d.get("amount")) if d.get("amount") else None),
+                  network=d.get("network"))
+    reconcile(ref)
+    return {"ok": True}
+
+@app.post("/hook/telegram")
+async def hook_telegram(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False}
+    msg = body.get("message") or body.get("edited_message") or {}
+    chat = (msg.get("chat") or {}).get("id")
+    if chat:
+        _set("tg_chat", chat)
+        if TELEGRAM_TOKEN:
+            try:
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                              json={"chat_id": chat, "text": "✅ Aura is connected. I'll alert you here whenever an order is paid but not delivered, or anything looks wrong."}, timeout=20)
+            except Exception:
+                pass
+    return {"ok": True}
+
+def run_sweep():
+    """Catch paid-but-stuck and delivered-but-unpaid orders. Safe to call often (cheap when nothing is wrong)."""
+    now = time.time(); cutoff = now - STUCK_MINUTES * 60
+    alerts = 0
+    # paid, but not completed and old enough
+    stuck = run("SELECT ref,phone,network,amount,delivery FROM recon WHERE paid=1 AND delivery!='completed' AND alerted=0 AND created < ?",
+                (cutoff,), "all") or []
+    for ref, phone, network, amount, delivery in stuck:
+        status = poll_delivery(ref)
+        if status == "COMPLETED":
+            run("UPDATE recon SET delivery='completed', delivered_at=?, alerted=1 WHERE ref=?", (now, ref))
+        elif status == "FAILED" or delivery == "failed":
+            tg_send(f"🚨 PAID but DELIVERY FAILED\nNetwork: {network}\nPhone: {phone}\nAmount: GH₵{amount}\nRef: {ref}\n→ Refund or resend.")
+            run("UPDATE recon SET delivery='failed', alerted=1 WHERE ref=?", (ref,)); alerts += 1
+        else:
+            tg_send(f"⏳ PAID but NOT delivered yet ({STUCK_MINUTES}+ min)\nNetwork: {network}\nPhone: {phone}\nAmount: GH₵{amount}\nRef: {ref}\n→ Check this order.")
+            run("UPDATE recon SET alerted=1 WHERE ref=?", (ref,)); alerts += 1
+    # delivered, but never paid
+    unpaid = run("SELECT ref,phone,network,amount FROM recon WHERE delivery='completed' AND paid=0 AND alerted=0 AND created < ?",
+                 (cutoff,), "all") or []
+    for ref, phone, network, amount in unpaid:
+        tg_send(f"⚠️ DELIVERED but NO payment found\nNetwork: {network}\nPhone: {phone}\nRef: {ref}\n→ You may have lost money on this one.")
+        run("UPDATE recon SET alerted=1 WHERE ref=?", (ref,)); alerts += 1
+    return {"ok": True, "alerts_sent": alerts, "checked_stuck": len(stuck), "checked_unpaid": len(unpaid)}
+
+@app.get("/sweep")
+def sweep(key: str = ""):
+    if key != ADMIN_KEY:
+        return {"ok": False, "error": "bad key"}
+    return run_sweep()
+
+@app.get("/ops/{biz_id}", response_class=HTMLResponse)
+def ops_dashboard(biz_id: str, key: str = ""):
+    if key != ADMIN_KEY:
+        return HTMLResponse("<body style='font-family:system-ui;background:#0b0f1a;color:#e6eeff;text-align:center;padding:60px'>"
+                            "<h2>🔒 Private</h2><p>Open with <code>?key=YOUR_KEY</code></p></body>")
+    rows = run("SELECT ref,phone,network,amount,paid,delivery,created FROM recon WHERE biz_id=? ORDER BY created DESC LIMIT 200",
+               (biz_id,), "all") or []
+    import datetime as _dt
+    total = len(rows)
+    success = sum(1 for r in rows if r[4] and r[5] == "completed")
+    problems = [r for r in rows if (r[4] and r[5] in ("failed",)) or (r[4] and r[5] != "completed") or (not r[4] and r[5] == "completed")]
+    def label(r):
+        paid, dl = r[4], r[5]
+        if paid and dl == "completed": return "✅ OK"
+        if paid and dl == "failed":    return "🚨 PAID, FAILED"
+        if paid and dl != "completed": return "⏳ PAID, pending"
+        if not paid and dl == "completed": return "⚠️ DELIVERED, unpaid"
+        return "…"
+    trs = "".join(
+        f"<tr><td>{_dt.datetime.fromtimestamp(r[6]).strftime('%d %b %H:%M')}</td><td>{r[2]}</td><td>{r[1]}</td>"
+        f"<td>GH₵{r[3]}</td><td>{label(r)}</td><td style='color:#56627f'>{r[0]}</td></tr>" for r in rows)
+    if not trs:
+        trs = "<tr><td colspan=6 style='color:#7a8aa0'>No transactions yet. Once Paystack + your data provider send webhooks here, they appear automatically.</td></tr>"
+    return ("<!doctype html><html><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>{biz_id} — Operations</title>"
+            "<style>body{font-family:system-ui,Arial;background:#0b0f1a;color:#e6eeff;margin:0;padding:18px}"
+            "h1{color:#3BE0FF;margin:0 0 4px}.sub{color:#7a8aa0;margin:0 0 16px}"
+            ".cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}"
+            ".c{background:#0f1730;border-radius:12px;padding:14px 18px;min-width:120px}"
+            ".c b{font-size:26px;display:block}.c span{color:#7a8aa0;font-size:13px}"
+            "table{width:100%;border-collapse:collapse;background:#0f1730;border-radius:10px;overflow:hidden}"
+            "th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #1c2740;font-size:13px}th{color:#7a8aa0}"
+            "</style></head><body>"
+            f"<h1>🛡️ {biz_id} — Operations Auditor</h1><p class=sub>Aura watches every order. Refresh to update.</p>"
+            f"<div class=cards><div class=c><b>{total}</b><span>Transactions</span></div>"
+            f"<div class=c><b style='color:#22c55e'>{success}</b><span>Successful</span></div>"
+            f"<div class=c><b style='color:#ef4444'>{len(problems)}</b><span>Need attention</span></div></div>"
+            "<table><tr><th>When</th><th>Network</th><th>Phone</th><th>Amount</th><th>Status</th><th>Ref</th></tr>"
+            + trs + "</table></body></html>")
 
 # ── Admin data (protected) ────────────────────────────────────────────────────
 @app.get("/admin_data")
