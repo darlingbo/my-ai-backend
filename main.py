@@ -1051,6 +1051,53 @@ async def hook_delivery(request: Request, biz: str = "elitedata"):
     reconcile(ref)
     return {"ok": True}
 
+# ── Telegram group manager: auto-post promos + answer questions ────────────────
+def tg_to(chat_id, text, reply_to=None):
+    if not TELEGRAM_TOKEN:
+        return
+    body = {"chat_id": chat_id, "text": text}
+    if reply_to:
+        body["reply_to_message_id"] = reply_to
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=body, timeout=20)
+    except Exception:
+        pass
+
+def _bot_username():
+    u = _get("bot_username")
+    if u:
+        return u
+    try:
+        u = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe", timeout=20).json()["result"]["username"]
+        _set("bot_username", u); return u
+    except Exception:
+        return ""
+
+def _brand_info():
+    return _get("brand") or (get_biz("elitedata") or {}).get("info", "") or "A data bundle business in Ghana."
+
+def make_promo():
+    system = ("You write short, warm promotional broadcast messages a business posts in its customer Telegram group. "
+              "Use a few tasteful emojis, one clear call-to-action, and keep it fresh — vary the wording each time so it "
+              "never looks copy-pasted. Output ONLY the message, no quotes or explanation.")
+    return ai_raw(system, f"Write today's update/promo message for this business. Details:\n{_brand_info()}", max_tokens=400)
+
+def post_promo_now():
+    groups = json.loads(_get("post_groups", "[]") or "[]")
+    if not groups:
+        return 0
+    msg = make_promo()
+    for g in groups:
+        tg_to(g, msg)
+    _set("last_promo", time.time())
+    return len(groups)
+
+def group_answer(text):
+    system = ("You are the helpful customer-service assistant for this business, replying inside its Telegram group. "
+              "Be short, friendly and accurate. Use ONLY the business info below; never invent prices. If you're unsure, "
+              "tell them to contact support. Business info:\n" + _brand_info())
+    return ai_raw(system, text[:1000], max_tokens=350)
+
 @app.post("/hook/telegram")
 async def hook_telegram(request: Request):
     try:
@@ -1058,21 +1105,73 @@ async def hook_telegram(request: Request):
     except Exception:
         return {"ok": False}
     msg = body.get("message") or body.get("edited_message") or {}
-    chat = (msg.get("chat") or {}).get("id")
-    if chat:
-        _set("tg_chat", chat)
-        if TELEGRAM_TOKEN:
-            try:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                              json={"chat_id": chat, "text": "✅ Aura is connected. I'll alert you here whenever an order is paid but not delivered, or anything looks wrong."}, timeout=20)
-            except Exception:
-                pass
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id"); ctype = chat.get("type", ""); text = (msg.get("text") or "").strip()
+    if not chat_id:
+        return {"ok": True}
+
+    if ctype == "private":
+        _set("tg_chat", chat_id)   # owner alert target
+        low = text.lower()
+        if low.startswith("/start") or not text:
+            tg_to(chat_id, "✅ Connected! I'll send your order alerts here.\n\nGroup commands:\n"
+                           "• Add me to your group as admin, then type /setup there\n"
+                           "• /postnow — post a promo to your group right now\n"
+                           "• /every 4h  (or /every 12h, /daily) — how often I auto-post\n"
+                           "• /brand <your business + website + prices> — what I promote\n"
+                           "• /groups — show linked groups")
+        elif low.startswith("/postnow"):
+            n = post_promo_now()
+            tg_to(chat_id, f"📢 Posted to {n} group(s)." if n else "No group linked yet. Add me to your group as admin and type /setup there.")
+        elif low.startswith("/every"):
+            m = re.search(r"(\d+)", low); h = int(m.group(1)) if m else 4
+            _set("post_interval_h", h); tg_to(chat_id, f"👍 I'll post every {h} hours.")
+        elif low.startswith("/daily"):
+            _set("post_interval_h", 24); tg_to(chat_id, "👍 I'll post once a day.")
+        elif low.startswith("/brand"):
+            info = text[6:].strip()
+            if info:
+                _set("brand", info); tg_to(chat_id, "✅ Saved — this is what I'll promote and answer about.")
+            else:
+                tg_to(chat_id, "Send it like:\n/brand GOODWAN DATA MART — data bundles for MTN/Telecel/AirtelTigo. Website: https://... Support: @GOODWAN_00")
+        elif low.startswith("/groups"):
+            gs = json.loads(_get("post_groups", "[]") or "[]")
+            tg_to(chat_id, f"🔗 Linked groups: {len(gs)}")
+        return {"ok": True}
+
+    # group / supergroup
+    low = text.lower()
+    gs = json.loads(_get("post_groups", "[]") or "[]")
+    gs_str = [str(x) for x in gs]
+    if "/setup" in low:
+        if str(chat_id) not in gs_str:
+            gs.append(chat_id); _set("post_groups", json.dumps(gs))
+        tg_to(chat_id, "✅ Aura is now managing this group! I'll post updates automatically and answer customers' questions. "
+                       "(Owner: message me in private and send /postnow to test, or /every 4h to set the schedule.)")
+        return {"ok": True}
+    if str(chat_id) in gs_str and text:
+        uname = (_bot_username() or "").lower()
+        mentioned = uname and ("@" + uname) in low
+        reply_user = (((msg.get("reply_to_message") or {}).get("from") or {}).get("username") or "").lower()
+        is_reply = uname and reply_user == uname
+        is_question = text.endswith("?") or any(w in low for w in
+                      ["how much", "price", "buy", "order", "when", "do you", "can i", "help", "available", "active"])
+        if mentioned or is_reply or is_question:
+            tg_to(chat_id, group_answer(text), reply_to=msg.get("message_id"))
     return {"ok": True}
 
 def run_sweep():
-    """Catch paid-but-stuck and delivered-but-unpaid orders. Safe to call often (cheap when nothing is wrong)."""
+    """Catch paid-but-stuck and delivered-but-unpaid orders + post scheduled group promos. Safe to call often."""
     now = time.time(); cutoff = now - STUCK_MINUTES * 60
     alerts = 0
+    # scheduled Telegram group promo
+    try:
+        if json.loads(_get("post_groups", "[]") or "[]"):
+            interval = float(_get("post_interval_h", "4") or 4) * 3600
+            if now - float(_get("last_promo", "0") or 0) >= interval:
+                post_promo_now()
+    except Exception:
+        pass
     # paid, but not completed and old enough
     stuck = run("SELECT ref,phone,network,amount,delivery FROM recon WHERE paid=1 AND delivery!='completed' AND alerted=0 AND created < ?",
                 (cutoff,), "all") or []
