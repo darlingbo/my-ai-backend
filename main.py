@@ -1012,6 +1012,34 @@ def ops_clear(biz_id: str = "elitedata", key: str = ""):
     run("DELETE FROM recon WHERE biz_id=?", (biz_id,))
     return {"ok": True, "cleared": biz_id}
 
+@app.get("/tg_init", response_class=HTMLResponse)
+def tg_init(key: str = ""):
+    """One-click Telegram setup: points the bot's webhook here so messages connect your chat."""
+    if key != ADMIN_KEY:
+        return HTMLResponse("<body style='font-family:system-ui;padding:40px'>Add ?key=YOUR_KEY</body>")
+    if not TELEGRAM_TOKEN:
+        return HTMLResponse("<body style='font-family:system-ui;padding:40px'><h3>⚠️ No Telegram token</h3>"
+                            "<p>Add <code>TELEGRAM_BOT_TOKEN</code> in your server settings first, then reload this page.</p></body>")
+    hook = f"{BACKEND_URL}/hook/telegram"
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+                         params={"url": hook}, timeout=20).json()
+        ok = r.get("ok")
+    except Exception as e:
+        ok = False; r = {"error": str(e)}
+    me = {}
+    try:
+        me = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe", timeout=20).json().get("result", {})
+    except Exception:
+        pass
+    uname = me.get("username", "your bot")
+    msg = ("✅ Connected!" if ok else "⚠️ Could not set webhook: " + str(r))
+    return HTMLResponse(
+        "<body style='font-family:system-ui;background:#0b0f1a;color:#e6eeff;text-align:center;padding:50px'>"
+        f"<h2>{msg}</h2>"
+        f"<p>Now open Telegram, find <b>@{uname}</b>, and send it any message (e.g. <b>hi</b>).</p>"
+        "<p>Aura will reply to confirm — after that, all Elite Data alerts come to you there.</p></body>")
+
 @app.get("/ops/{biz_id}", response_class=HTMLResponse)
 def ops_dashboard(biz_id: str, key: str = ""):
     if key != ADMIN_KEY:
