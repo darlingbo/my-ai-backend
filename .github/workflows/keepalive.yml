@@ -1,0 +1,22 @@
+name: Keep Aura Awake
+
+# Pings the server every 10 minutes so Render's free plan
+# never puts it to sleep -> no more 60-second cold starts.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the server
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 https://my-ai-backend-itf0.onrender.com/status || echo "000")
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then echo "Aura is awake ✅"; exit 0; fi
+            sleep 10
+          done
+          echo "Server did not respond 200, but ping sent (it is waking)."
