@@ -537,29 +537,52 @@ def _cf_image(prompt):
     except Exception:
         return None
 
+HF_ENDPOINTS = ("https://router.huggingface.co/hf-inference/models/{m}",
+                "https://api-inference.huggingface.co/models/{m}")
+
 def _hf_image(prompt):
     if not HF_TOKEN:
         return None
     import base64
-    for _ in range(3):
-        try:
-            r = requests.post(f"https://api-inference.huggingface.co/models/{HF_MODEL}",
-                              headers={"Authorization": f"Bearer {HF_TOKEN}"},
-                              json={"inputs": prompt[:2000]}, timeout=120)
-            ctype = r.headers.get("content-type", "")
-            if r.status_code == 200 and ctype.startswith("image"):
-                return "data:image/png;base64," + base64.b64encode(r.content).decode()
-            if r.status_code == 503:   # model warming up
-                time.sleep(8); continue
-            return None
-        except Exception:
-            return None
+    for url_t in HF_ENDPOINTS:
+        url = url_t.format(m=HF_MODEL)
+        for _ in range(2):
+            try:
+                r = requests.post(url, headers={"Authorization": f"Bearer {HF_TOKEN}", "Accept": "image/png"},
+                                  json={"inputs": prompt[:2000]}, timeout=120)
+                ctype = r.headers.get("content-type", "")
+                if r.status_code == 200 and ctype.startswith("image"):
+                    return "data:image/png;base64," + base64.b64encode(r.content).decode()
+                if r.status_code == 503:   # model warming up
+                    time.sleep(8); continue
+                break   # other error → try next endpoint
+            except Exception:
+                break
     return None
 
 def make_image(prompt):
     """Generate an image and return a data: URI, or None if no provider is configured/working.
     Order: Cloudflare (if keys set) → Hugging Face token (if key set)."""
     return _cf_image(prompt) or _hf_image(prompt)
+
+@app.get("/img_debug")
+def img_debug(key: str = ""):
+    """Diagnose why image generation isn't working (owner only)."""
+    if key != ADMIN_KEY:
+        return {"ok": False, "error": "bad key"}
+    info = {"hf_token_set": bool(HF_TOKEN), "cf_set": bool(CF_ACCOUNT_ID and CF_API_TOKEN), "model": HF_MODEL, "tests": []}
+    if HF_TOKEN:
+        for url_t in HF_ENDPOINTS:
+            url = url_t.format(m=HF_MODEL)
+            try:
+                r = requests.post(url, headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                                  json={"inputs": "a red apple"}, timeout=60)
+                ct = r.headers.get("content-type", "")
+                info["tests"].append({"url": url, "status": r.status_code, "ctype": ct,
+                                      "body": ("<image bytes>" if ct.startswith("image") else r.text[:400])})
+            except Exception as e:
+                info["tests"].append({"url": url, "error": str(e)})
+    return info
 
 @app.post("/chat")
 def chat(inp: ChatIn, bg: BackgroundTasks):
