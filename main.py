@@ -795,7 +795,8 @@ def parse_order(biz_id, text):
     run("INSERT INTO orders(order_id, biz_id, network, bundle, phone, amount, note, status, ts) VALUES(?,?,?,?,?,?,?,?,?)",
         (oid, biz_id, fields.get("network", ""), fields.get("bundle", ""), fields.get("phone", ""),
          amount, "", "new", time.time()))
-    return clean, {"order_id": oid, "amount": amount, "phone": fields.get("phone", "")}
+    return clean, {"order_id": oid, "amount": amount, "phone": fields.get("phone", ""),
+                   "network": fields.get("network", ""), "bundle": fields.get("bundle", "")}
 
 @app.post("/biz_chat")
 def biz_chat(inp: BizChatIn):
@@ -1157,6 +1158,43 @@ def group_answer(text):
               "Business info:\n" + _brand_info())
     return ai_raw(system, text[:1000], max_tokens=350)
 
+def handle_telegram_order(chat_id, msg, text):
+    """Customer chatting the bot: answer naturally, capture orders, alert the owner, send a pay link."""
+    biz = get_biz("elitedata")
+    if not biz:
+        tg_to(chat_id, group_answer(text)); return
+    sess = str(chat_id)
+    rows = run("SELECT role, content FROM biz_msgs WHERE biz_id=? AND session=? ORDER BY ts DESC LIMIT 12",
+               ("elitedata", sess), "all") or []
+    history = [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    reply = biz_reply(biz, history, text)
+    reply, order = parse_order("elitedata", reply)
+    run("INSERT INTO biz_msgs(biz_id, session, role, content, ts) VALUES(?,?,?,?,?)", ("elitedata", sess, "user", text[:2000], time.time()))
+    run("INSERT INTO biz_msgs(biz_id, session, role, content, ts) VALUES(?,?,?,?,?)", ("elitedata", sess, "assistant", reply[:2000], time.time()))
+    tg_to(chat_id, reply)
+    if not order:
+        return
+    # alert the owner on Telegram
+    owner = _get("tg_chat") or _get("owner_chat")
+    frm = msg.get("from") or {}
+    cname = frm.get("first_name", "") or ""
+    if frm.get("username"):
+        cname += f" (@{frm['username']})"
+    if owner:
+        tg_to(owner, "🛒 NEW ORDER (Telegram)\n"
+                     f"Network: {order['network']}\nBundle: {order['bundle']}\n"
+                     f"Load number: {order['phone']}\nAmount: GH₵{order['amount']}\n"
+                     f"Customer: {cname or frm.get('id', '?')}")
+    # send the customer a secure pay link
+    amt = (order["amount"] or "").replace("GH₵", "").replace("GHS", "").strip()
+    if PAYSTACK_SECRET and amt.replace(".", "").isdigit() and float(amt) > 0:
+        pr = _paystack_init(amt, f"{order['phone'] or order['order_id']}@elitedata.pay",
+                            {"biz_id": "elitedata", "order_id": order["order_id"], "source": "telegram"})
+        if pr.get("ok"):
+            tg_to(chat_id, f"💳 Tap to pay GH₵{amt} securely:\n{pr['url']}")
+            return
+    tg_to(chat_id, "You can complete payment on our website 👉 https://www.elitedata1.com")
+
 def _register_chat(cid):
     """Add a group/channel to the auto-post list. Returns True if newly added."""
     gs = json.loads(_get("post_groups", "[]") or "[]")
@@ -1212,11 +1250,11 @@ async def hook_telegram(request: Request):
         low = text.lower()
 
         if not is_owner:
-            # A customer messaged the bot (it's listed as Support) → Aura answers them
+            # A customer messaged the bot (it's listed as Support) → Aura chats, takes orders, sends pay link
             if not text:
-                tg_to(chat_id, "Hi! 👋 Welcome — how can I help you with your data bundle today?")
-            else:
-                tg_to(chat_id, group_answer(text))
+                tg_to(chat_id, "Hi! 👋 Welcome to Elite Data — what can I do for you today?")
+                return {"ok": True}
+            handle_telegram_order(chat_id, msg, text)
             return {"ok": True}
 
         # ---- Owner controls ----
