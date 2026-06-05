@@ -294,6 +294,8 @@ class BizPayIn(BaseModel):
     biz_id: str; amount: str = ""; phone: str = ""; order_id: str = ""
 class BizSetIn(BaseModel):
     key: str = ""; biz_id: str; name: str = ""; info: str = ""; greeting: str = ""; color: str = ""
+class BrandIn(BaseModel):
+    key: str = ""; text: str
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/status")
@@ -619,6 +621,16 @@ def sys_check(key: str = ""):
             out["data_api_reachable"] = False
             out["data_api_error"] = str(e)
     return out
+
+@app.post("/set_brand")
+def set_brand(inp: BrandIn):
+    """Owner: set the business info (prices etc.) used by BOTH the website widget and Telegram."""
+    if inp.key != ADMIN_KEY:
+        return {"ok": False, "error": "bad key"}
+    _set("brand", inp.text)
+    if get_biz("elitedata"):
+        run("UPDATE biz SET info=? WHERE biz_id=?", (inp.text, "elitedata"))
+    return {"ok": True, "length": len(inp.text)}
 
 @app.post("/chat")
 def chat(inp: ChatIn, bg: BackgroundTasks):
