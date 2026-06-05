@@ -769,10 +769,14 @@ def biz_reply(biz, history, message):
         "of your reply (on its own line), filling the values:\n"
         "[[ORDER network=MTN; bundle=5GB; phone=0241234567; amount=25]]\n"
         "Use amount only if you know the price; otherwise write amount=?. Write the [[ORDER ...]] line ONLY when all "
-        "details are gathered and confirmed — never before. The customer never sees this line; just speak normally above it.\n"
-        "Never discuss anything unrelated to this business.\n\n"
+        "details are gathered and confirmed — never before. The customer never sees this line; just speak normally above it.\n\n"
         f"=== BUSINESS INFORMATION ===\n{biz['info']}\n=== END ==="
     )
+    cl = channel_link()
+    if cl:
+        system += (f"\n\nTELEGRAM CHANNEL: We have a channel with daily deals & updates: {cl} . "
+                   "When it fits naturally (e.g. after helping or after an order), warmly invite the customer to join it "
+                   "for offers and fast updates. Don't force it into every single message.")
     msgs = [{"role": "system", "content": system}]
     for m in (history or [])[-12:]:
         role = "assistant" if m.get("role") == "assistant" else "user"
@@ -1175,6 +1179,49 @@ def tg_to(chat_id, text, reply_to=None):
     except Exception:
         pass
 
+def tg_photo(chat_id, img_bytes, caption=""):
+    if not TELEGRAM_TOKEN or not img_bytes:
+        return False
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                          data={"chat_id": chat_id, "caption": caption[:1000]},
+                          files={"photo": ("promo.png", img_bytes)}, timeout=90)
+        return r.json().get("ok", False)
+    except Exception:
+        return False
+
+def make_promo_image():
+    """Generate a branded promo graphic and return raw image bytes (or None)."""
+    import base64
+    prompt = ("vibrant modern advertisement graphic for fast mobile internet data bundles, a glowing smartphone with "
+              "full signal bars, lightning bolt for speed, bright blue and green, clean eye-catching telecom poster, "
+              "high quality, no text")
+    data = make_image(prompt)
+    if data and data.startswith("data:") and "," in data:
+        try:
+            return base64.b64decode(data.split(",", 1)[1])
+        except Exception:
+            return None
+    return None
+
+def channel_link():
+    """Get (or create, since the bot is admin) a shareable invite link for the channel."""
+    link = _get("channel_link")
+    if link:
+        return link
+    gs = json.loads(_get("post_groups", "[]") or "[]")
+    if not gs or not TELEGRAM_TOKEN:
+        return ""
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/createChatInviteLink",
+                          json={"chat_id": gs[0]}, timeout=20).json()
+        link = (r.get("result") or {}).get("invite_link", "")
+        if link:
+            _set("channel_link", link)
+        return link
+    except Exception:
+        return ""
+
 def _bot_username():
     u = _get("bot_username")
     if u:
@@ -1222,8 +1269,14 @@ def post_promo_now():
     if not groups:
         return 0
     msg = make_promo()
+    img = None
+    try:
+        img = make_promo_image()
+    except Exception:
+        img = None
     for g in groups:
-        tg_to(g, msg)
+        if not (img and tg_photo(g, img, msg)):
+            tg_to(g, msg)
     _set("last_promo", time.time())
     return len(groups)
 
@@ -1234,6 +1287,9 @@ def group_answer(text):
               "For anything about the business (bundles, prices, ordering, paying) use ONLY the info below and NEVER invent a "
               "price. For everything else, just answer helpfully. When they want to buy, tell them how to order/pay from the info.\n"
               "Business info:\n" + _brand_info())
+    cl = channel_link()
+    if cl:
+        system += f"\nOur Telegram channel for daily deals: {cl} — invite them to join when it fits."
     return ai_raw(system, text[:1000], max_tokens=350)
 
 def handle_telegram_order(chat_id, msg, text):
