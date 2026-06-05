@@ -1185,18 +1185,32 @@ async def hook_telegram(request: Request):
             _register_chat(fwd["id"])
             tg_to(chat_id, f"✅ Linked '{fwd.get('title', 'your channel')}'! Send /postnow now to test a post there.")
             return {"ok": True}
-        _set("tg_chat", chat_id)   # owner alert target
+        # Work out who this is: the owner (you) or a customer reaching AI support
+        owner = _get("owner_chat") or _get("tg_chat") or str(chat_id)
+        _set("owner_chat", owner)
+        is_owner = str(chat_id) == str(owner)
         low = text.lower()
+
+        if not is_owner:
+            # A customer messaged the bot (it's listed as Support) → Aura answers them
+            if not text:
+                tg_to(chat_id, "Hi! 👋 Welcome — how can I help you with your data bundle today?")
+            else:
+                tg_to(chat_id, group_answer(text))
+            return {"ok": True}
+
+        # ---- Owner controls ----
+        _set("tg_chat", chat_id)   # your order alerts come here
         if low.startswith("/start") or not text:
-            tg_to(chat_id, "✅ Connected! I'll send your order alerts here.\n\nGroup commands:\n"
-                           "• Add me to your group as admin, then type /setup there\n"
-                           "• /postnow — post a promo to your group right now\n"
+            tg_to(chat_id, "✅ You're set as the OWNER here. I'll send your order alerts to this chat.\n\nCommands:\n"
+                           "• /postnow — post a promo to your channel now\n"
                            "• /every 4h  (or /every 12h, /daily) — how often I auto-post\n"
-                           "• /brand <your business + website + prices> — what I promote\n"
-                           "• /groups — show linked groups")
+                           "• /brand <business + website + prices> — what I promote & answer about\n"
+                           "• /groups — show linked channels/groups\n\n"
+                           "💡 Customers who message me are answered automatically using your /brand info.")
         elif low.startswith("/postnow"):
             n = post_promo_now()
-            tg_to(chat_id, f"📢 Posted to {n} group(s)." if n else "No group linked yet. Add me to your group as admin and type /setup there.")
+            tg_to(chat_id, f"📢 Posted to {n} channel(s)." if n else "No channel linked yet. Post /setup in your channel first.")
         elif low.startswith("/every"):
             m = re.search(r"(\d+)", low); h = int(m.group(1)) if m else 4
             _set("post_interval_h", h); tg_to(chat_id, f"👍 I'll post every {h} hours.")
@@ -1205,12 +1219,12 @@ async def hook_telegram(request: Request):
         elif low.startswith("/brand"):
             info = text[6:].strip()
             if info:
-                _set("brand", info); tg_to(chat_id, "✅ Saved — this is what I'll promote and answer about.")
+                _set("brand", info); tg_to(chat_id, "✅ Saved — this is what I'll promote and answer customers about.")
             else:
-                tg_to(chat_id, "Send it like:\n/brand GOODWAN DATA MART — data bundles for MTN/Telecel/AirtelTigo. Website: https://... Support: @GOODWAN_00")
+                tg_to(chat_id, "Send it like:\n/brand Elite Data — data bundles for MTN/Telecel/AirtelTigo. Order here: https://yoursite.com  Support: @DarlingAura_bot")
         elif low.startswith("/groups"):
             gs = json.loads(_get("post_groups", "[]") or "[]")
-            tg_to(chat_id, f"🔗 Linked groups: {len(gs)}")
+            tg_to(chat_id, f"🔗 Linked channels/groups: {len(gs)}")
         return {"ok": True}
 
     # group / supergroup
