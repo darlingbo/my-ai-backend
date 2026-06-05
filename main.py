@@ -584,6 +584,42 @@ def img_debug(key: str = ""):
                 info["tests"].append({"url": url, "error": str(e)})
     return info
 
+@app.get("/sys_check")
+def sys_check(key: str = ""):
+    """Owner-only: shows what's connected (booleans + live tests, never the secret values)."""
+    if key != ADMIN_KEY:
+        return {"ok": False, "error": "bad key"}
+    out = {
+        "image_HF_TOKEN": bool(HF_TOKEN),
+        "telegram_token": bool(TELEGRAM_TOKEN),
+        "data_api_base_set": bool(DATA_API_BASE),
+        "data_api_key_set": bool(DATA_API_KEY),
+        "paystack_set": bool(PAYSTACK_SECRET),
+    }
+    # Telegram: who is the bot + is the webhook pointed at us?
+    if TELEGRAM_TOKEN:
+        try:
+            me = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe", timeout=20).json()
+            out["telegram_bot"] = me.get("result", {}).get("username")
+        except Exception as e:
+            out["telegram_bot"] = f"error: {e}"
+        try:
+            wh = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo", timeout=20).json()
+            out["telegram_webhook"] = wh.get("result", {}).get("url") or "(not set — open /tg_init)"
+        except Exception:
+            pass
+    # Data API: can we reach it? (a dummy order lookup just to see the connection responds)
+    if DATA_API_BASE and DATA_API_KEY:
+        try:
+            r = requests.get(f"{DATA_API_BASE}/api/developer/orders/connectivity_test",
+                             headers={"Authorization": f"Bearer {DATA_API_KEY}"}, timeout=30)
+            out["data_api_reachable"] = True
+            out["data_api_status_code"] = r.status_code   # 404/200 both mean "reached it"; 401 = bad key
+        except Exception as e:
+            out["data_api_reachable"] = False
+            out["data_api_error"] = str(e)
+    return out
+
 @app.post("/chat")
 def chat(inp: ChatIn, bg: BackgroundTasks):
     # Business AI: 7-day free trial, then must subscribe
