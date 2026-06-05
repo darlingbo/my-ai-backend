@@ -1063,6 +1063,55 @@ def reconcile(ref):
     elif paid and delivery == "completed":
         run("UPDATE recon SET alerted=1 WHERE ref=?", (ref,))   # healthy, close it silently
 
+_NET_MAP = {"mtn": "MTN", "telecel": "TELECEL", "vodafone": "TELECEL",
+            "airteltigo": "AT ISHARE", "at": "AT ISHARE", "airtel": "AT ISHARE", "tigo": "AT ISHARE"}
+
+def fulfill_order(order_id):
+    """After payment: auto-deliver the bundle via the supplier API and notify customer + owner."""
+    row = run("SELECT network, bundle, phone, amount, status, note FROM orders WHERE order_id=?", (order_id,), "one")
+    if not row:
+        return
+    network, bundle, phone, amount, status, note = row
+    if status == "delivered":
+        return
+    owner = _get("tg_chat") or _get("owner_chat")
+    cust_chat = note[3:] if (note and str(note).startswith("tg:")) else None
+    mm = re.search(r"(\d+)", bundle or "")
+    size = int(mm.group(1)) if mm else None
+    api_net = _NET_MAP.get((network or "").strip().lower(), (network or "").upper())
+
+    if DATA_API_BASE and DATA_API_KEY and size and phone:
+        try:
+            r = requests.post(f"{DATA_API_BASE}/api/developer/purchase",
+                              headers={"Authorization": f"Bearer {DATA_API_KEY}", "Content-Type": "application/json"},
+                              json={"network": api_net, "Phone": phone, "Datasize": size, "reference": order_id}, timeout=45)
+            try:
+                ok = bool(r.json().get("success"))
+            except Exception:
+                ok = (r.status_code == 200)
+            if ok:
+                run("UPDATE orders SET status='delivered' WHERE order_id=?", (order_id,))
+                if cust_chat:
+                    tg_to(cust_chat, f"✅ Done! Your {bundle} {network} bundle has been sent to {phone}. Enjoy! 🎉")
+                if owner:
+                    tg_to(owner, f"✅ AUTO-DELIVERED\n{network} {bundle} → {phone}\nGH₵{amount}")
+            else:
+                run("UPDATE orders SET status='failed' WHERE order_id=?", (order_id,))
+                if owner:
+                    tg_to(owner, f"🚨 AUTO-DELIVERY FAILED — paid but supplier rejected\n{network} {bundle} → {phone}\nGH₵{amount}\n{str(r.text)[:160]}\n→ Deliver manually / refund.")
+        except Exception as e:
+            run("UPDATE orders SET status='failed' WHERE order_id=?", (order_id,))
+            if owner:
+                tg_to(owner, f"🚨 AUTO-DELIVERY ERROR\n{network} {bundle} → {phone}\n{e}\n→ Deliver manually.")
+    else:
+        # No supplier API connected → tell owner to load it manually
+        run("UPDATE orders SET status='paid' WHERE order_id=?", (order_id,))
+        extra = "" if (DATA_API_BASE and DATA_API_KEY) else "\n(Add DATA_API_BASE + DATA_API_KEY to auto-deliver.)"
+        if owner:
+            tg_to(owner, f"💰 PAID — load it manually\n{network} {bundle} → {phone}\nGH₵{amount}{extra}")
+        if cust_chat:
+            tg_to(cust_chat, f"✅ Payment received! Your {bundle} {network} will be loaded to {phone} shortly. 🙏")
+
 @app.post("/hook/paystack")
 async def hook_paystack(request: Request, biz: str = "elitedata"):
     raw = await request.body()
@@ -1084,6 +1133,9 @@ async def hook_paystack(request: Request, biz: str = "elitedata"):
         if ref:
             _recon_upsert(ref, biz, paid=1, paid_at=time.time(), amount=str(amount), phone=phone or None)
             reconcile(ref)
+        order_id = meta.get("order_id")
+        if order_id:
+            fulfill_order(order_id)   # auto-deliver the bundle
     return {"ok": True}
 
 @app.post("/hook/delivery")
@@ -1174,6 +1226,8 @@ def handle_telegram_order(chat_id, msg, text):
     tg_to(chat_id, reply)
     if not order:
         return
+    # remember this customer's chat so we can notify them after payment/delivery
+    run("UPDATE orders SET note=? WHERE order_id=?", (f"tg:{chat_id}", order["order_id"]))
     # alert the owner on Telegram
     owner = _get("tg_chat") or _get("owner_chat")
     frm = msg.get("from") or {}
