@@ -1134,12 +1134,41 @@ def group_answer(text):
               "tell them to contact support. Business info:\n" + _brand_info())
     return ai_raw(system, text[:1000], max_tokens=350)
 
+def _register_chat(cid):
+    """Add a group/channel to the auto-post list. Returns True if newly added."""
+    gs = json.loads(_get("post_groups", "[]") or "[]")
+    if str(cid) not in [str(x) for x in gs]:
+        gs.append(cid); _set("post_groups", json.dumps(gs))
+        return True
+    return False
+
 @app.post("/hook/telegram")
 async def hook_telegram(request: Request):
     try:
         body = await request.json()
     except Exception:
         return {"ok": False}
+
+    # Bot was added to / promoted in a channel or group → auto-link it
+    mcm = body.get("my_chat_member") or body.get("chat_member")
+    if mcm:
+        ch = mcm.get("chat") or {}
+        status = ((mcm.get("new_chat_member") or {}).get("status") or "")
+        if ch.get("id") and ch.get("type") in ("channel", "group", "supergroup") and status in ("administrator", "member", "creator"):
+            _register_chat(ch["id"])
+            tg_to(ch["id"], "✅ Aura is connected here! I'll post your updates automatically. (Owner: message me in private and send /postnow to test.)")
+        return {"ok": True}
+
+    # A post inside a channel (e.g. the owner posts "/setup")
+    cpost = body.get("channel_post")
+    if cpost:
+        ch = cpost.get("chat") or {}
+        if ch.get("id"):
+            _register_chat(ch["id"])
+            if "/setup" in (cpost.get("text") or "").lower():
+                tg_to(ch["id"], "✅ Linked! I'll post here automatically. Send /postnow to me in private to test.")
+        return {"ok": True}
+
     msg = body.get("message") or body.get("edited_message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id"); ctype = chat.get("type", ""); text = (msg.get("text") or "").strip()
@@ -1147,6 +1176,12 @@ async def hook_telegram(request: Request):
         return {"ok": True}
 
     if ctype == "private":
+        # Easiest linking: forward any post from your channel/group to the bot
+        fwd = msg.get("forward_from_chat") or {}
+        if fwd.get("id") and fwd.get("type") in ("channel", "group", "supergroup"):
+            _register_chat(fwd["id"])
+            tg_to(chat_id, f"✅ Linked '{fwd.get('title', 'your channel')}'! Send /postnow now to test a post there.")
+            return {"ok": True}
         _set("tg_chat", chat_id)   # owner alert target
         low = text.lower()
         if low.startswith("/start") or not text:
@@ -1253,7 +1288,10 @@ def tg_init(key: str = ""):
     hook = f"{BACKEND_URL}/hook/telegram"
     try:
         r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-                         params={"url": hook}, timeout=20).json()
+                         params={"url": hook,
+                                 "allowed_updates": json.dumps(["message", "edited_message", "channel_post",
+                                                                "edited_channel_post", "my_chat_member", "chat_member"])},
+                         timeout=20).json()
         ok = r.get("ok")
     except Exception as e:
         ok = False; r = {"error": str(e)}
