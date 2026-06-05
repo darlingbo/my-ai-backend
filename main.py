@@ -1113,9 +1113,12 @@ def _brand_info():
     return _get("brand") or (get_biz("elitedata") or {}).get("info", "") or "A data bundle business in Ghana."
 
 def make_promo():
-    system = ("You write short, warm promotional broadcast messages a business posts in its customer Telegram group. "
-              "Use a few tasteful emojis, one clear call-to-action, and keep it fresh — vary the wording each time so it "
-              "never looks copy-pasted. Output ONLY the message, no quotes or explanation.")
+    system = ("You write short, warm promotional broadcast messages a business posts in its customer Telegram channel. "
+              "Use a few tasteful emojis and one clear call-to-action. Keep it fresh — vary the wording each time so it "
+              "never looks copy-pasted. CRITICAL: include the business's exact website link(s) and support contact "
+              "EXACTLY as written in the details — paste real URLs in full (e.g. https://...), never replace them with "
+              "'our website'. If a detail like a link is missing, simply leave it out — do NOT invent a URL or handle. "
+              "Output ONLY the message, no quotes or explanation.")
     return ai_raw(system, f"Write today's update/promo message for this business. Details:\n{_brand_info()}", max_tokens=400)
 
 def post_promo_now():
