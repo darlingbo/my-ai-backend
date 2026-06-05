@@ -622,6 +622,12 @@ def sys_check(key: str = ""):
             out["data_api_error"] = str(e)
     return out
 
+@app.get("/promo_preview")
+def promo_preview(key: str = ""):
+    if key != ADMIN_KEY:
+        return {"ok": False}
+    return {"post": make_promo()}
+
 @app.post("/set_brand")
 def set_brand(inp: BrandIn):
     """Owner: set the business info (prices etc.) used by BOTH the website widget and Telegram."""
@@ -1182,14 +1188,34 @@ def _bot_username():
 def _brand_info():
     return _get("brand") or (get_biz("elitedata") or {}).get("info", "") or "A data bundle business in Ghana."
 
+PROMO_THEMES = [
+    "a warm, upbeat GOOD DAY greeting inviting customers to order their data today",
+    "BRAG about super-fast delivery — bundles delivered instantly, in seconds, 24/7, no delays",
+    "show the business is GROWING and trusted by happy customers (use real order numbers only if they are meaningful)",
+    "spotlight a BEST-VALUE deal — pick one bundle and hype its price as a hot offer",
+    "a TRUST message — safe Paystack payments, instant automatic delivery, always online",
+    "an ENGAGING question or quick tip to get customers replying (e.g. which network do you use?)",
+    "a friendly REMINDER to top up before their data runs out",
+    "an evening THANK-YOU to customers with an invite to grab a bundle for the night",
+]
+
 def make_promo():
-    system = ("You write short, warm promotional broadcast messages a business posts in its customer Telegram channel. "
-              "Use a few tasteful emojis and one clear call-to-action. Keep it fresh — vary the wording each time so it "
-              "never looks copy-pasted. CRITICAL: include the business's exact website link(s) and support contact "
-              "EXACTLY as written in the details — paste real URLs in full (e.g. https://...), never replace them with "
-              "'our website'. If a detail like a link is missing, simply leave it out — do NOT invent a URL or handle. "
-              "Output ONLY the message, no quotes or explanation.")
-    return ai_raw(system, f"Write today's update/promo message for this business. Details:\n{_brand_info()}", max_tokens=400)
+    i = int(_get("promo_i", "0") or 0)
+    theme = PROMO_THEMES[i % len(PROMO_THEMES)]
+    _set("promo_i", i + 1)
+    total = (run("SELECT COUNT(*) FROM orders WHERE biz_id=?", ("elitedata",), "one") or [0])[0]
+    delivered = (run("SELECT COUNT(*) FROM orders WHERE biz_id=? AND status IN ('delivered','paid')", ("elitedata",), "one") or [0])[0]
+    stats = f"Total orders: {total}. Successfully delivered: {delivered}."
+    system = ("You write a SHORT, lively promotional post for a data-bundle business's Telegram channel. "
+              "Make it POP with lots of fun emojis 🎉🔥📱💨⚡✅. Keep it fresh and DIFFERENT every single time — never repeat a "
+              "previous post. End with ONE clear call-to-action. Include the business's exact website link in full (https://...) "
+              "if it is in the details — never write 'our website' instead of the link. "
+              "Do NOT invent numbers — only mention order counts if they are given AND meaningful; if the numbers are 0 or tiny, "
+              "talk about speed/quality/reliability instead of numbers. Output ONLY the post text.")
+    prompt = (f"Write a post with THIS focus: {theme}.\n"
+              f"Real business stats (use only if meaningful, never inflate): {stats}\n"
+              f"Business details:\n{_brand_info()}")
+    return ai_raw(system, prompt, max_tokens=400)
 
 def post_promo_now():
     groups = json.loads(_get("post_groups", "[]") or "[]")
